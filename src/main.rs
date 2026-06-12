@@ -5,20 +5,40 @@ use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
 
 use hunkle::app::{App, Outcome};
-use hunkle::{backend, ui};
+use hunkle::{backend, headless, ui};
 
 #[derive(Parser)]
 #[command(name = "hunkle", version)]
 struct Args {
-    #[arg(long, default_value = "git")]
+    #[arg(long, global = true, default_value = "git")]
     backend: String,
-    #[arg(short = 'C', long = "dir", default_value = ".")]
+    #[arg(short = 'C', long = "dir", global = true, default_value = ".")]
     dir: PathBuf,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(clap::Subcommand)]
+enum Cmd {
+    Dump,
+    Apply,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let backend = backend::create(&args.backend, &args.dir)?;
+    match args.cmd {
+        Some(Cmd::Dump) => {
+            println!("{}", headless::dump(backend.as_ref())?);
+            return Ok(());
+        }
+        Some(Cmd::Apply) => {
+            let input = std::io::read_to_string(std::io::stdin())?;
+            println!("{}", headless::apply(backend.as_ref(), &input)?);
+            return Ok(());
+        }
+        None => {}
+    }
     let state = backend.read_state()?;
     let mut app = App::new(state);
     if app.pending().is_empty() {

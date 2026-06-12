@@ -17,7 +17,10 @@ pub enum Mode {
         input: String,
         lines: Option<Vec<usize>>,
     },
-    Review { sel: usize, edit: Option<String> },
+    Review {
+        sel: usize,
+        edit: Option<String>,
+    },
     Manage {
         cursor: usize,
         mark: Option<usize>,
