@@ -14,6 +14,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_review(f, app, main);
     } else if matches!(app.mode, Mode::Manage { .. }) {
         draw_manage(f, app, main);
+    } else if matches!(app.mode, Mode::Assigned { .. }) {
+        draw_assigned(f, app, main);
     } else {
         let [diff, side] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(36)]).areas(main);
@@ -223,6 +225,73 @@ fn draw_review(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn draw_assigned(f: &mut Frame, app: &App, area: Rect) {
+    let Mode::Assigned { cursor } = &app.mode else {
+        return;
+    };
+    let rows = app.assigned_rows();
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::styled(
+        "assigned hunks — already sorted into commits:",
+        Style::new().fg(Color::DarkGray),
+    ));
+    lines.push(Line::raw(""));
+    for (idx, &(fi, hi, ci)) in rows.iter().enumerate() {
+        let file = &app.files[fi];
+        let hunk = &file.hunks[hi];
+        let (mut add, mut del) = (0, 0);
+        for (li, l) in hunk.lines.iter().enumerate() {
+            if app.assign[fi][hi][li] == Some(ci) {
+                match l.kind {
+                    LineKind::Add => add += 1,
+                    LineKind::Del => del += 1,
+                    LineKind::Context => {}
+                }
+            }
+        }
+        let selected = idx == *cursor;
+        let reverse = |s: Style| {
+            if selected {
+                s.add_modifier(Modifier::REVERSED)
+            } else {
+                s
+            }
+        };
+        let marker = if selected { '>' } else { ' ' };
+        let spec = &app.commits[ci];
+        let mut spans = vec![
+            Span::styled(
+                format!("{marker}[{}] ", App::key_label(ci)),
+                reverse(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            ),
+            Span::styled(
+                format!(
+                    "{}  {}  (+{add} -{del})  {}",
+                    file.path, hunk.header, spec.message
+                ),
+                reverse(Style::new()),
+            ),
+        ];
+        if let Some(branch) = &spec.branch {
+            spans.push(Span::styled(
+                format!(" -> {branch}"),
+                reverse(Style::new().fg(Color::Magenta)),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let view_h = area.height.saturating_sub(2);
+    let cursor_row = (*cursor as u16).saturating_add(2);
+    let scroll = if view_h > 0 && cursor_row >= view_h {
+        cursor_row - view_h + 1
+    } else {
+        0
+    };
+    let block = Block::bordered().title(" assigned hunks ");
+    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+}
+
 fn draw_manage(f: &mut Frame, app: &App, area: Rect) {
     let Mode::Manage { cursor, mark, .. } = &app.mode else {
         return;
@@ -307,19 +376,22 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else {
         let hints = match &app.mode {
             Mode::Browse => {
-                "1-9/0<id> assign hunk | n new commit | b new branch commit | v pick lines | s/h skip/back | j/k scroll | u unassign | m manage | d review | q quit"
+                "1-9/0<id> assign | n new commit | b new branch | v pick lines | s/h skip | j/k scroll | u unassign | a assigned | m manage | d review | C-z undo | q quit"
             }
             Mode::Select { .. } => {
                 "space toggle | a all | 1-9/0<id> assign selection | n new commit | b new branch commit | j/k move | esc cancel"
             }
             Mode::Review { edit: Some(_), .. } => "enter: save message, esc: cancel",
             Mode::Review { .. } => {
-                "enter create commits | e edit message | m manage | j/k move | esc back | q quit"
+                "enter create commits | e edit message | a assigned | m manage | j/k move | esc back | q quit"
             }
             Mode::Manage { mark: Some(_), .. } => {
                 "enter/space swap with marked | j/k move | esc back"
             }
             Mode::Manage { .. } => "enter/space mark commit | j/k move | esc back",
+            Mode::Assigned { .. } => {
+                "1-9/0<id> reassign | u unassign | e edit message | j/k move | esc/a back | q quit"
+            }
             Mode::Name { .. } | Mode::Branch { .. } => unreachable!(),
         };
         Line::styled(hints, Style::new().fg(Color::DarkGray))

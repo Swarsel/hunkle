@@ -21,6 +21,8 @@ It is mostly self explaining, but here are the keybinds:
 | `s` / `h` | skip to next / previous pending hunk |
 | `j` / `k` | scroll down/up |
 | `u` | unassign all lines of the current hunk |
+| `a` | open the assigned-hunks overview |
+| `C-z` | undo the last action |
 | `d` / `enter` | go to the review screen |
 | `q` | quit |
 | `<?>` | probably others I will forget in the future :p |

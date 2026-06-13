@@ -31,7 +31,12 @@ pub enum Mode {
         mark: Option<usize>,
         back: Option<usize>,
     },
+    Assigned {
+        cursor: usize,
+    },
 }
+
+type Snapshot = (Vec<CommitSpec>, Assignments);
 
 pub enum Outcome {
     Quit,
@@ -54,6 +59,7 @@ pub struct App {
     pub request_commit: bool,
     pub outcome: Option<Outcome>,
     pub ext_input: Option<String>,
+    undo_stack: Vec<Snapshot>,
 }
 
 impl App {
@@ -74,6 +80,7 @@ impl App {
             request_commit: false,
             outcome: None,
             ext_input: None,
+            undo_stack: Vec::new(),
         }
     }
 
@@ -167,6 +174,75 @@ impl App {
         }
     }
 
+    pub fn assigned_rows(&self) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        for (fi, f) in self.files.iter().enumerate() {
+            for hi in 0..f.hunks.len() {
+                let mut seen: Vec<usize> = Vec::new();
+                for a in self.assign[fi][hi].iter().flatten() {
+                    if !seen.contains(a) {
+                        seen.push(*a);
+                    }
+                }
+                seen.sort_unstable();
+                for ci in seen {
+                    out.push((fi, hi, ci));
+                }
+            }
+        }
+        out
+    }
+
+    fn push_undo(&mut self) {
+        const LIMIT: usize = 100;
+        if self.undo_stack.len() == LIMIT {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack
+            .push((self.commits.clone(), self.assign.clone()));
+    }
+
+    fn undo(&mut self) {
+        let Some((commits, assign)) = self.undo_stack.pop() else {
+            self.status = Some("nothing to undo".to_string());
+            return;
+        };
+        self.commits = commits;
+        self.assign = assign;
+        self.ext_input = None;
+        self.scroll = 0;
+        let n = self.pending().len();
+        self.pos = self.pos.min(n.saturating_sub(1));
+        self.mode = Mode::Browse;
+        self.status = Some("undid last change".to_string());
+    }
+
+    fn reassign_row(&mut self, fi: usize, hi: usize, from: usize, to: usize) {
+        let mut count = 0;
+        for a in self.assign[fi][hi].iter_mut() {
+            if *a == Some(from) {
+                *a = Some(to);
+                count += 1;
+            }
+        }
+        self.status = Some(format!(
+            "moved {count} line(s) to [{}] {}",
+            Self::key_label(to),
+            self.commit_label(to)
+        ));
+    }
+
+    fn unassign_row(&mut self, fi: usize, hi: usize, ci: usize) {
+        let mut count = 0;
+        for a in self.assign[fi][hi].iter_mut() {
+            if *a == Some(ci) {
+                *a = None;
+                count += 1;
+            }
+        }
+        self.status = Some(format!("unassigned {count} line(s)"));
+    }
+
     fn assign_current(&mut self, commit: usize, lines: Option<Vec<usize>>) {
         let Some((fi, hi)) = self.current() else {
             return;
@@ -199,10 +275,25 @@ impl App {
                 } else {
                     let mut lines: Vec<usize> = selected.iter().copied().collect();
                     lines.sort_unstable();
+                    self.push_undo();
                     self.assign_current(ci, Some(lines));
                 }
             }
-            _ => self.assign_current(ci, None),
+            Mode::Assigned { cursor } => {
+                let cursor = *cursor;
+                if let Some(&(fi, hi, from)) = self.assigned_rows().get(cursor) {
+                    if from == ci {
+                        self.status = Some("already on that commit".to_string());
+                    } else {
+                        self.push_undo();
+                        self.reassign_row(fi, hi, from, ci);
+                    }
+                }
+            }
+            _ => {
+                self.push_undo();
+                self.assign_current(ci, None);
+            }
         }
     }
 
@@ -270,6 +361,10 @@ impl App {
             self.outcome = Some(Outcome::Quit);
             return;
         }
+        if key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.undo();
+            return;
+        }
         if self.ext_input.is_some() {
             self.key_ext(key);
             return;
@@ -281,6 +376,7 @@ impl App {
             Mode::Name { .. } => self.key_name(key),
             Mode::Review { .. } => self.key_review(key),
             Mode::Manage { .. } => self.key_manage(key),
+            Mode::Assigned { .. } => self.key_assigned(key),
         }
     }
 
@@ -319,6 +415,7 @@ impl App {
                 Some(m) => {
                     let cur = *cursor;
                     *mark = None;
+                    self.push_undo();
                     self.swap_commits(m, cur);
                     self.status = Some(format!(
                         "swapped [{}] <-> [{}]",
@@ -327,6 +424,51 @@ impl App {
                     ));
                 }
             },
+            _ => {}
+        }
+    }
+
+    fn open_assigned(&mut self) {
+        if self.has_assignments() {
+            self.mode = Mode::Assigned { cursor: 0 };
+        } else {
+            self.status = Some("nothing assigned yet".to_string());
+        }
+    }
+
+    fn key_assigned(&mut self, key: KeyEvent) {
+        let rows = self.assigned_rows();
+        let Mode::Assigned { cursor } = &mut self.mode else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('a') => self.mode = Mode::Browse,
+            KeyCode::Char('j') | KeyCode::Down => {
+                *cursor = (*cursor + 1).min(rows.len().saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => *cursor = cursor.saturating_sub(1),
+            KeyCode::Char(c @ '1'..='9') => self.assign_via_key(c as usize - '1' as usize),
+            KeyCode::Char('0') => self.start_ext(),
+            KeyCode::Char('e') => {
+                if let Some(&(_, _, ci)) = rows.get(*cursor) {
+                    self.mode = Mode::Review {
+                        sel: ci,
+                        edit: Some(self.commits[ci].message.clone()),
+                    };
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Some(&(fi, hi, ci)) = rows.get(*cursor) {
+                    self.push_undo();
+                    self.unassign_row(fi, hi, ci);
+                    let n = self.assigned_rows().len();
+                    if n == 0 {
+                        self.mode = Mode::Browse;
+                    } else if let Mode::Assigned { cursor } = &mut self.mode {
+                        *cursor = (*cursor).min(n - 1);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -372,6 +514,10 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::Char('u') => {
                 if let Some((fi, hi)) = self.current() {
+                    let has = self.assign[fi][hi].iter().any(Option::is_some);
+                    if has {
+                        self.push_undo();
+                    }
                     let mut n = 0;
                     for a in self.assign[fi][hi].iter_mut() {
                         if a.is_some() {
@@ -386,6 +532,7 @@ impl App {
                     });
                 }
             }
+            KeyCode::Char('a') => self.open_assigned(),
             KeyCode::Char('m') => {
                 if self.commits.is_empty() {
                     self.status = Some("no commits to manage yet".to_string());
@@ -522,9 +669,11 @@ impl App {
                     return;
                 }
                 let lines = lines.take();
+                let branch = branch.take();
+                self.push_undo();
                 self.commits.push(CommitSpec {
                     message: msg,
-                    branch: branch.take(),
+                    branch,
                 });
                 self.assign_current(self.commits.len() - 1, lines);
             }
@@ -582,6 +731,7 @@ impl App {
                     };
                 }
             }
+            KeyCode::Char('a') => self.open_assigned(),
             KeyCode::Esc | KeyCode::Char('b') => {
                 if pending_left {
                     self.mode = Mode::Browse;
@@ -623,6 +773,10 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_key(KeyEvent::from(code));
+    }
+
+    fn press_ctrl(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::CONTROL));
     }
 
     fn name_commit(app: &mut App, name: &str) {
@@ -735,6 +889,79 @@ mod tests {
         assert_eq!(app.commits[0].message, "fix");
         assert_eq!(app.commits[0].branch.as_deref(), Some("topic"));
         assert_eq!(app.assign[0][0][0], Some(0));
+    }
+
+    #[test]
+    fn undo_reverts_last_assignment() {
+        let mut app = app_with_hunks(3);
+        name_commit(&mut app, "c0");
+        let snapshot = app.assign.clone();
+        let (fi, hi) = app.current().unwrap();
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.assign[fi][hi][0], Some(0));
+
+        press_ctrl(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.assign, snapshot);
+        assert!(matches!(app.mode, Mode::Browse));
+    }
+
+    #[test]
+    fn undo_reverts_commit_creation() {
+        let mut app = app_with_hunks(2);
+        name_commit(&mut app, "c0");
+        assert_eq!(app.commits.len(), 1);
+        assert!(app.has_assignments());
+
+        press_ctrl(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.commits.len(), 0);
+        assert!(!app.has_assignments());
+
+        press_ctrl(&mut app, KeyCode::Char('z'));
+        assert!(app.status.as_deref() == Some("nothing to undo"));
+    }
+
+    #[test]
+    fn assigned_overview_reassign_unassign_and_edit() {
+        let mut app = app_with_hunks(3);
+        name_commit(&mut app, "c0");
+        name_commit(&mut app, "c1");
+        assert_eq!(app.assigned_rows(), vec![(0, 0, 0), (0, 1, 1)]);
+
+        press(&mut app, KeyCode::Char('a'));
+        assert!(matches!(app.mode, Mode::Assigned { cursor: 0 }));
+
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.assign[0][0][0], Some(1));
+        assert_eq!(app.assigned_rows(), vec![(0, 0, 1), (0, 1, 1)]);
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.assign[0][1][0], None);
+        assert_eq!(app.assigned_rows(), vec![(0, 0, 1)]);
+        assert!(matches!(app.mode, Mode::Assigned { cursor: 0 }));
+
+        press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(
+            app.mode,
+            Mode::Review {
+                sel: 1,
+                edit: Some(_)
+            }
+        ));
+
+        press_ctrl(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.assign[0][1][0], Some(1));
+    }
+
+    #[test]
+    fn assigned_overview_empties_back_to_browse() {
+        let mut app = app_with_hunks(1);
+        name_commit(&mut app, "c0");
+        press(&mut app, KeyCode::Char('a'));
+        assert!(matches!(app.mode, Mode::Assigned { .. }));
+        press(&mut app, KeyCode::Char('u'));
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(!app.has_assignments());
     }
 
     #[test]
