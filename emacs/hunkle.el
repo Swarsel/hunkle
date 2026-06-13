@@ -594,27 +594,38 @@ tree (unless the file has unstaged edits)."
                             (if (> left 0)
                                 (format " (%d lines stay staged)" left)
                               "")))
-      (let* ((result (hunkle--apply))
-             (commits (alist-get 'commits result))
-             (skipped (alist-get 'worktree_skipped result)))
-        (message "hunkle: created %d commit(s): %s%s"
-                 (length commits)
-                 (mapconcat (lambda (c)
-                              (format "%.10s %s%s"
-                                      (alist-get 'id c) (alist-get 'message c)
-                                      (if (alist-get 'branch c)
-                                          (format " -> %s" (alist-get 'branch c))
-                                        "")))
-                            commits ", ")
-                 (if skipped
-                     (format "; kept branch lines in worktree of %s (unstaged edits)"
-                             (string-join skipped ", "))
-                   ""))
-        (when (fboundp 'magit-refresh-all)
-          (magit-refresh-all))
-        (if (> left 0)
-            (hunkle--soft-reload)
-          (quit-window t))))))
+      (condition-case err
+          (let* ((result (hunkle--apply))
+                 (commits (alist-get 'commits result))
+                 (skipped (alist-get 'worktree_skipped result)))
+            (message "hunkle: created %d commit(s): %s%s"
+                     (length commits)
+                     (mapconcat (lambda (c)
+                                  (format "%.10s %s%s"
+                                          (alist-get 'id c) (alist-get 'message c)
+                                          (if (alist-get 'branch c)
+                                              (format " -> %s" (alist-get 'branch c))
+                                            "")))
+                                commits ", ")
+                     (if skipped
+                         (format "; kept branch lines in worktree of %s (unstaged edits)"
+                                 (string-join skipped ", "))
+                       ""))
+            (when (fboundp 'magit-refresh-all)
+              (require 'magit-commit nil t)
+              (require 'magit-apply nil t)
+              (magit-refresh-all))
+            (if (> left 0)
+                (hunkle--soft-reload)
+              (quit-window t)))
+        (error
+         (if (string-match-p "changed since" (error-message-string err))
+             (when (yes-or-no-p
+                    "Staged changes were modified outside hunkle; reload (assignments are lost)? ")
+               (hunkle--load)
+               (hunkle--render)
+               (message "Reloaded; the staged changes now match the buffer again"))
+           (signal (car err) (cdr err))))))))
 
 (defun hunkle-quit ()
   "Quit the hunkle buffer without creating any commits.
