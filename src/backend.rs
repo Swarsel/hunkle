@@ -79,6 +79,12 @@ impl GitBackend {
             .to_string())
     }
 
+    fn gpg_sign(&self) -> bool {
+        self.git_str(&["config", "--bool", "--get", "commit.gpgsign"], None)
+            .map(|s| s == "true")
+            .unwrap_or(false)
+    }
+
     fn head(&self) -> Option<String> {
         self.git_str(&["rev-parse", "--verify", "--quiet", "HEAD"], None)
             .ok()
@@ -152,6 +158,7 @@ impl Backend for GitBackend {
         }
         let git_dir = self.git_str(&["rev-parse", "--absolute-git-dir"], None)?;
         let original_head = self.head();
+        let sign = self.gpg_sign();
         let mut tmp_indexes: Vec<PathBuf> = Vec::new();
 
         let result = (|| {
@@ -202,6 +209,9 @@ impl Backend for GitBackend {
                 }
                 let tree = self.git_str(&["write-tree"], idx)?;
                 let mut args = vec!["commit-tree", tree.as_str()];
+                if sign {
+                    args.push("-S");
+                }
                 if let Some(p) = parent.as_deref() {
                     args.push("-p");
                     args.push(p);

@@ -23,7 +23,7 @@
         inherit pname version;
         src = inputs.self;
         cargoLock.lockFile = inputs.self + "/Cargo.lock";
-        nativeCheckInputs = [ pkgs.git ];
+        nativeCheckInputs = [ pkgs.git pkgs.openssh ];
         meta.mainProgram = "hunkle";
       };
 

@@ -248,3 +248,55 @@ fn unborn_branch_creates_first_commits() {
     assert_eq!(log.trim(), "initial");
     assert_eq!(git(dir, &["diff", "--cached"]), "");
 }
+
+#[test]
+fn signs_commits_when_configured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup_repo(dir);
+
+    let key = dir.join("id");
+    let keygen = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f"])
+        .arg(&key)
+        .output();
+    match keygen {
+        Ok(out) if out.status.success() => {}
+        _ => {
+            eprintln!("skipping signs_commits_when_configured: ssh-keygen unavailable");
+            return;
+        }
+    }
+    let pub_path = dir.join("id.pub");
+    let pub_key = fs::read_to_string(&pub_path).unwrap();
+    let allowed = dir.join("allowed_signers");
+    fs::write(&allowed, format!("* {}", pub_key.trim())).unwrap();
+    git(dir, &["config", "gpg.format", "ssh"]);
+    git(
+        dir,
+        &["config", "user.signingkey", pub_path.to_str().unwrap()],
+    );
+    git(dir, &["config", "commit.gpgsign", "true"]);
+    git(
+        dir,
+        &[
+            "config",
+            "gpg.ssh.allowedSignersFile",
+            allowed.to_str().unwrap(),
+        ],
+    );
+
+    fs::write(dir.join("a.txt"), "hello\n").unwrap();
+    git(dir, &["add", "-A"]);
+
+    let backend = backend::create("git", dir).unwrap();
+    let state = backend.read_state().unwrap();
+    let mut assign = empty_assignments(&state.files);
+    for li in changed_lines(&state.files[0], 0) {
+        assign[0][0][li] = Some(0);
+    }
+    let plan = build_plan(&state.files, &assign, &state.bases, &[spec("signed")]);
+    backend.create_commits(&plan).unwrap();
+
+    assert_eq!(git(dir, &["log", "--format=%G?", "-1"]).trim(), "G");
+}
