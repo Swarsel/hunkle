@@ -55,8 +55,50 @@
 
       perSystem = { config, self', pkgs, ... }:
         let
-          emacsWithMagit = (pkgs.emacsPackagesFor pkgs.emacs).emacsWithPackages
-            (epkgs: [ epkgs.magit ]);
+          emacsWithHunkle = (pkgs.emacsPackagesFor pkgs.emacs).emacsWithPackages
+            (epkgs: [ epkgs.magit (mkHunkleEl epkgs self'.packages.hunkle) ]);
+
+          demoRepoSetup = ''
+            repo="$(mktemp -d -t hunkle-demo.XXXXXX)"
+            trap 'rm -rf "$repo"' EXIT
+            cd "$repo"
+            git init -q -b main
+            git config user.name demo
+            git config user.email demo@example.com
+            git config commit.gpgsign false
+
+            seq 30 | sed 's/^/alpha line /' > a.txt
+            seq 30 | sed 's/^/beta line /' > b.txt
+            git add -A
+            git commit -qm base
+
+            sed -i '3s/$/ (edited)/;25s/$/ (edited)/' a.txt
+            sed -i '12s/$/ (edited)/' b.txt
+            printf 'a brand new file\nwith two lines\n' > c.txt
+            git add -A
+
+            echo "hunkle demo repo: $repo (removed on exit)"
+          '';
+
+          demo = pkgs.writeShellApplication {
+            name = "hunkle-demo";
+            runtimeInputs = [ pkgs.git pkgs.coreutils pkgs.gnused self'.packages.hunkle ];
+            excludeShellChecks = [ "SC2016" ];
+            text = demoRepoSetup + ''
+              hunkle "$@"
+            '';
+          };
+
+          demo-emacs = pkgs.writeShellApplication {
+            name = "hunkle-demo-emacs";
+            runtimeInputs = [ pkgs.git pkgs.coreutils pkgs.gnused emacsWithHunkle ];
+            excludeShellChecks = [ "SC2016" ];
+            text = demoRepoSetup + ''
+              emacs -q \
+                --eval "(progn (require 'hunkle) (hunkle-magit-setup) (setq default-directory \"$repo/\") (hunkle))" \
+                "$@"
+            '';
+          };
 
           elispFmt = pkgs.writeText "hunkle-elisp-fmt.el" ''
             (require 'magit)
@@ -80,7 +122,7 @@
               statix.enable = true;
             };
             settings.formatter.elisp = {
-              command = "${emacsWithMagit}/bin/emacs";
+              command = "${emacsWithHunkle}/bin/emacs";
               options = [ "--batch" "-l" "${elispFmt}" ];
               includes = [ "*.el" ];
             };
@@ -102,7 +144,19 @@
           packages = rec {
             hunkle = mkHunkle pkgs;
             hunkle-emacs = mkHunkleEl pkgs.emacsPackages hunkle;
+            inherit demo demo-emacs;
             default = hunkle;
+          };
+
+          apps = {
+            demo = {
+              type = "app";
+              program = pkgs.lib.getExe demo;
+            };
+            demo-emacs = {
+              type = "app";
+              program = pkgs.lib.getExe demo-emacs;
+            };
           };
 
           checks = {
@@ -110,7 +164,7 @@
             emacs-tests =
               pkgs.runCommandLocal "hunkle-emacs-tests"
                 {
-                  nativeBuildInputs = [ emacsWithMagit pkgs.git ];
+                  nativeBuildInputs = [ emacsWithHunkle pkgs.git ];
                   HUNKLE_BIN = pkgs.lib.getExe self'.packages.hunkle;
                 }
                 ''
@@ -125,7 +179,7 @@
 
           devShells.default = pkgs.mkShell {
             inputsFrom = [ self'.packages.default ];
-            nativeBuildInputs = [ emacsWithMagit ] ++ (with pkgs; [
+            nativeBuildInputs = [ emacsWithHunkle ] ++ (with pkgs; [
               rust-analyzer
               clippy
               rustfmt
