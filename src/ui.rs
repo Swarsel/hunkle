@@ -123,15 +123,22 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::DarkGray),
         ));
     }
-    for (ci, msg) in app.commits.iter().enumerate() {
+    for (ci, spec) in app.commits.iter().enumerate() {
         let (add, del) = app.commit_stats(ci);
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 format!("[{}] ", App::key_label(ci)),
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(msg.clone()),
-        ]));
+            Span::raw(spec.message.clone()),
+        ];
+        if let Some(branch) = &spec.branch {
+            spans.push(Span::styled(
+                format!(" -> {branch}"),
+                Style::new().fg(Color::Magenta),
+            ));
+        }
+        lines.push(Line::from(spans));
         lines.push(Line::styled(
             format!("      +{add} -{del}"),
             Style::new().fg(Color::DarkGray),
@@ -156,7 +163,7 @@ fn draw_review(f: &mut Frame, app: &App, area: Rect) {
         Style::new().fg(Color::DarkGray),
     ));
     lines.push(Line::raw(""));
-    for (ci, msg) in app.commits.iter().enumerate() {
+    for (ci, spec) in app.commits.iter().enumerate() {
         let (add, del) = app.commit_stats(ci);
         let empty = add + del == 0;
         let mut style = Style::new();
@@ -165,17 +172,22 @@ fn draw_review(f: &mut Frame, app: &App, area: Rect) {
         }
         let text = match edit {
             Some(buf) if ci == *sel => format!("[{}] {buf}_", App::key_label(ci)),
-            _ => format!("[{}] {msg}", App::key_label(ci)),
+            _ => format!("[{}] {}", App::key_label(ci), spec.message),
         };
         let note = if empty {
             "  (empty — skipped)".to_string()
         } else {
             format!("  (+{add} -{del})")
         };
-        lines.push(Line::from(vec![
-            Span::styled(text, style),
-            Span::styled(note, Style::new().fg(Color::DarkGray)),
-        ]));
+        let mut spans = vec![Span::styled(text, style)];
+        if let Some(branch) = &spec.branch {
+            spans.push(Span::styled(
+                format!(" -> {branch}"),
+                Style::new().fg(Color::Magenta),
+            ));
+        }
+        spans.push(Span::styled(note, Style::new().fg(Color::DarkGray)));
+        lines.push(Line::from(spans));
     }
     lines.push(Line::raw(""));
     let left = app.unassigned_count();
@@ -189,6 +201,24 @@ fn draw_review(f: &mut Frame, app: &App, area: Rect) {
         format!("committing onto: {}", app.branch),
         Style::new().fg(Color::DarkGray),
     ));
+    let mut branches: Vec<&str> = Vec::new();
+    for spec in &app.commits {
+        if let Some(b) = &spec.branch
+            && !branches.contains(&b.as_str())
+        {
+            branches.push(b);
+        }
+    }
+    if !branches.is_empty() {
+        lines.push(Line::styled(
+            format!("new branch(es) from HEAD: {}", branches.join(", ")),
+            Style::new().fg(Color::Magenta),
+        ));
+        lines.push(Line::styled(
+            "lines committed to a branch are unstaged here and removed from the working tree.",
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
     let block = Block::bordered().title(" review ");
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -203,7 +233,7 @@ fn draw_manage(f: &mut Frame, app: &App, area: Rect) {
         Style::new().fg(Color::DarkGray),
     ));
     lines.push(Line::raw(""));
-    for (ci, msg) in app.commits.iter().enumerate() {
+    for (ci, spec) in app.commits.iter().enumerate() {
         let (add, del) = app.commit_stats(ci);
         let marked = *mark == Some(ci);
         let mut style = Style::new();
@@ -214,13 +244,21 @@ fn draw_manage(f: &mut Frame, app: &App, area: Rect) {
             style = style.add_modifier(Modifier::REVERSED);
         }
         let marker = if marked { '*' } else { ' ' };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{marker}[{}] {msg}", App::key_label(ci)), style),
-            Span::styled(
-                format!("  (+{add} -{del})"),
-                Style::new().fg(Color::DarkGray),
-            ),
-        ]));
+        let mut spans = vec![Span::styled(
+            format!("{marker}[{}] {}", App::key_label(ci), spec.message),
+            style,
+        )];
+        if let Some(branch) = &spec.branch {
+            spans.push(Span::styled(
+                format!(" -> {branch}"),
+                Style::new().fg(Color::Magenta),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("  (+{add} -{del})"),
+            Style::new().fg(Color::DarkGray),
+        ));
+        lines.push(Line::from(spans));
     }
     let block = Block::bordered().title(" manage commits ");
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -237,9 +275,26 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(Color::DarkGray),
             ),
         ])
-    } else if let Mode::Name { input, .. } = &app.mode {
+    } else if let Mode::Name { input, branch, .. } = &app.mode {
+        let prompt = match branch {
+            Some(b) => format!("new commit message (on {b}): "),
+            None => "new commit message: ".to_string(),
+        };
         Line::from(vec![
-            Span::styled("new commit message: ", Style::new().fg(Color::Cyan)),
+            Span::styled(prompt, Style::new().fg(Color::Cyan)),
+            Span::raw(input.clone()),
+            Span::styled("_", Style::new().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(
+                "   (enter: confirm, esc: cancel)",
+                Style::new().fg(Color::DarkGray),
+            ),
+        ])
+    } else if let Mode::Branch { input, .. } = &app.mode {
+        Line::from(vec![
+            Span::styled(
+                "new branch name (from HEAD): ",
+                Style::new().fg(Color::Cyan),
+            ),
             Span::raw(input.clone()),
             Span::styled("_", Style::new().add_modifier(Modifier::SLOW_BLINK)),
             Span::styled(
@@ -252,10 +307,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else {
         let hints = match &app.mode {
             Mode::Browse => {
-                "1-9/0<id> assign hunk | n new commit | v pick lines | s/h skip/back | j/k scroll | u unassign | m manage | d review | q quit"
+                "1-9/0<id> assign hunk | n new commit | b new branch commit | v pick lines | s/h skip/back | j/k scroll | u unassign | m manage | d review | q quit"
             }
             Mode::Select { .. } => {
-                "space toggle | a all | 1-9/0<id> assign selection | n new commit | j/k move | esc cancel"
+                "space toggle | a all | 1-9/0<id> assign selection | n new commit | b new branch commit | j/k move | esc cancel"
             }
             Mode::Review { edit: Some(_), .. } => "enter: save message, esc: cancel",
             Mode::Review { .. } => {
@@ -265,7 +320,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 "enter/space swap with marked | j/k move | esc back"
             }
             Mode::Manage { .. } => "enter/space mark commit | j/k move | esc back",
-            Mode::Name { .. } => unreachable!(),
+            Mode::Name { .. } | Mode::Branch { .. } => unreachable!(),
         };
         Line::styled(hints, Style::new().fg(Color::DarkGray))
     };

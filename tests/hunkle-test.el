@@ -79,7 +79,7 @@
 (ert-deftest hunkle-assign-and-create-commits ()
   (let ((dir (hunkle-test--make-repo)))
     (hunkle-test--with-buffer dir
-      (setq hunkle--commits (list "first" "second"))
+      (setq hunkle--commits (list (cons "first" nil) (cons "second" nil)))
       (hunkle--assign-locs (hunkle--hunk-locs 0 0) 0)
       (hunkle--assign-locs (hunkle--hunk-locs 0 1) 1)
       ;; Only "alpha" of new.txt goes into the first commit.
@@ -88,7 +88,7 @@
       (should (equal (hunkle--commit-stats 0) '(2 . 1)))
       ;; Assigned lines are tagged in the buffer.
       (should (string-match-p "\\[1\\] +\\+LINE2" (buffer-string)))
-      (let ((commits (hunkle--apply)))
+      (let ((commits (alist-get 'commits (hunkle--apply))))
         (should (= (length commits) 2))
         (should (equal (alist-get 'message (car commits)) "first"))))
     (should (equal (split-string (hunkle-test--git dir "log" "--format=%s"))
@@ -102,7 +102,7 @@
 (ert-deftest hunkle-begin-selection-assigns-only-selected-lines ()
   (let ((dir (hunkle-test--make-repo)))
     (hunkle-test--with-buffer dir
-      (setq hunkle--commits (list "c"))
+      (setq hunkle--commits (list (cons "c" nil)))
       ;; v on the +alpha line, no movement: selects just that line.
       (goto-char (point-min))
       (search-forward "+alpha")
@@ -119,7 +119,7 @@
 (ert-deftest hunkle-select-line-grabs-whole-line-from-mid-column ()
   (let ((dir (hunkle-test--make-repo)))
     (hunkle-test--with-buffer dir
-      (setq hunkle--commits (list "c"))
+      (setq hunkle--commits (list (cons "c" nil)))
       (goto-char (point-min))
       (search-forward "+alpha")
       (forward-line 0)
@@ -146,21 +146,45 @@
 (ert-deftest hunkle-swap-remaps-assignments ()
   (let ((dir (hunkle-test--make-repo)))
     (hunkle-test--with-buffer dir
-      (setq hunkle--commits (list "a" "b"))
+      (setq hunkle--commits (list (cons "a" nil) (cons "b" nil)))
       (hunkle--assign-locs (hunkle--hunk-locs 0 0) 0)
       (hunkle--assign-locs (hunkle--hunk-locs 0 1) 1)
       (cl-letf (((symbol-function 'read-number) (lambda (&rest _) 2))
                 ((symbol-function 'hunkle--commit-at-point-or-read)
                  (lambda (&rest _) 0)))
         (hunkle-swap-commits))
-      (should (equal hunkle--commits '("b" "a")))
+      (should (equal hunkle--commits '(("b") ("a"))))
       (should (eql (gethash (car (hunkle--hunk-locs 0 0)) hunkle--assign) 1))
       (should (eql (gethash (car (hunkle--hunk-locs 0 1)) hunkle--assign) 0)))))
+
+(ert-deftest hunkle-branch-commit-creates-branch ()
+  (let ((dir (hunkle-test--make-repo)))
+    (hunkle-test--with-buffer dir
+      (setq hunkle--commits (list (cons "local" nil) (cons "side" "topic")))
+      (hunkle--assign-locs (hunkle--hunk-locs 0 0) 0)
+      (hunkle--assign-locs (hunkle--hunk-locs 0 1) 1)
+      (hunkle--assign-locs (hunkle--hunk-locs 1 0) 1)
+      (should (string-match-p "side -> topic" (buffer-string)))
+      (let* ((result (hunkle--apply))
+             (commits (alist-get 'commits result)))
+        (should (= (length commits) 2))
+        (should (equal (alist-get 'branch (cadr commits)) "topic"))
+        (should (null (alist-get 'worktree_skipped result)))))
+    (should (equal (split-string (hunkle-test--git dir "log" "--format=%s"))
+                   '("local" "base")))
+    (should (equal (split-string
+                    (hunkle-test--git dir "log" "--format=%s" "topic"))
+                   '("side" "base")))
+    ;; Branch-assigned changes leave the index and the working tree.
+    (should (equal (hunkle-test--git dir "show" "topic:new.txt") "alpha\nbeta\n"))
+    (should-not (file-exists-p (expand-file-name "new.txt" dir)))
+    (should (equal (hunkle-test--git dir "diff" "--cached") ""))
+    (should (equal (hunkle-test--git dir "diff") ""))))
 
 (ert-deftest hunkle-stale-token-rejected ()
   (let ((dir (hunkle-test--make-repo)))
     (hunkle-test--with-buffer dir
-      (setq hunkle--commits (list "x"))
+      (setq hunkle--commits (list (cons "x" nil)))
       (hunkle--assign-locs (hunkle--hunk-locs 0 0) 0)
       ;; Staged state changes behind our back.
       (with-temp-file (expand-file-name "other.txt" dir)

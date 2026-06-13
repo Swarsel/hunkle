@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::backend::RepoState;
 use crate::diff::{FileDiff, LineKind};
-use crate::model::{Assignments, PlannedCommit, build_plan, empty_assignments};
+use crate::model::{Assignments, CommitSpec, Plan, build_plan, empty_assignments};
 
 #[derive(Debug)]
 pub enum Mode {
@@ -13,9 +13,14 @@ pub enum Mode {
         cursor: usize,
         selected: HashSet<usize>,
     },
+    Branch {
+        input: String,
+        lines: Option<Vec<usize>>,
+    },
     Name {
         input: String,
         lines: Option<Vec<usize>>,
+        branch: Option<String>,
     },
     Review {
         sel: usize,
@@ -30,7 +35,10 @@ pub enum Mode {
 
 pub enum Outcome {
     Quit,
-    Committed(Vec<(String, String)>),
+    Committed {
+        commits: Vec<(String, String, Option<String>)>,
+        worktree_skipped: Vec<String>,
+    },
 }
 
 pub struct App {
@@ -38,7 +46,7 @@ pub struct App {
     pub bases: HashMap<String, Vec<u8>>,
     pub branch: String,
     pub assign: Assignments,
-    pub commits: Vec<String>,
+    pub commits: Vec<CommitSpec>,
     pub pos: usize,
     pub scroll: u16,
     pub mode: Mode,
@@ -147,8 +155,16 @@ impl App {
         n
     }
 
-    pub fn plan(&self) -> Vec<PlannedCommit> {
+    pub fn plan(&self) -> Plan {
         build_plan(&self.files, &self.assign, &self.bases, &self.commits)
+    }
+
+    pub fn commit_label(&self, ci: usize) -> String {
+        let spec = &self.commits[ci];
+        match &spec.branch {
+            Some(b) => format!("{} -> {b}", spec.message),
+            None => spec.message.clone(),
+        }
     }
 
     fn assign_current(&mut self, commit: usize, lines: Option<Vec<usize>>) {
@@ -163,7 +179,7 @@ impl App {
         self.status = Some(format!(
             "{count} line(s) -> [{}] {}",
             Self::key_label(commit),
-            self.commits[commit]
+            self.commit_label(commit)
         ));
         self.after_assign();
     }
@@ -261,6 +277,7 @@ impl App {
         match &mut self.mode {
             Mode::Browse => self.key_browse(key),
             Mode::Select { .. } => self.key_select(key),
+            Mode::Branch { .. } => self.key_branch(key),
             Mode::Name { .. } => self.key_name(key),
             Mode::Review { .. } => self.key_review(key),
             Mode::Manage { .. } => self.key_manage(key),
@@ -322,6 +339,13 @@ impl App {
             KeyCode::Char('0') => self.start_ext(),
             KeyCode::Char('n') => {
                 self.mode = Mode::Name {
+                    input: String::new(),
+                    lines: None,
+                    branch: None,
+                };
+            }
+            KeyCode::Char('b') => {
+                self.mode = Mode::Branch {
                     input: String::new(),
                     lines: None,
                 };
@@ -416,15 +440,23 @@ impl App {
             }
             KeyCode::Char(c @ '1'..='9') => self.assign_via_key(c as usize - '1' as usize),
             KeyCode::Char('0') => self.start_ext(),
-            KeyCode::Char('n') => {
+            KeyCode::Char('n') | KeyCode::Char('b') => {
                 if selected.is_empty() {
                     self.status = Some("no lines selected (space toggles)".to_string());
                 } else {
                     let mut lines: Vec<usize> = selected.iter().copied().collect();
                     lines.sort_unstable();
-                    self.mode = Mode::Name {
-                        input: String::new(),
-                        lines: Some(lines),
+                    self.mode = if key.code == KeyCode::Char('b') {
+                        Mode::Branch {
+                            input: String::new(),
+                            lines: Some(lines),
+                        }
+                    } else {
+                        Mode::Name {
+                            input: String::new(),
+                            lines: Some(lines),
+                            branch: None,
+                        }
                     };
                 }
             }
@@ -432,20 +464,57 @@ impl App {
         }
     }
 
-    fn key_name(&mut self, key: KeyEvent) {
-        let Mode::Name { input, lines } = &mut self.mode else {
+    fn back_from_input(lines: Option<Vec<usize>>) -> Mode {
+        match lines {
+            Some(lines) => Mode::Select {
+                cursor: 0,
+                selected: lines.into_iter().collect(),
+            },
+            None => Mode::Browse,
+        }
+    }
+
+    fn key_branch(&mut self, key: KeyEvent) {
+        let Mode::Branch { input, lines } = &mut self.mode else {
             return;
         };
         match key.code {
-            KeyCode::Esc => {
-                self.mode = match lines.take() {
-                    Some(lines) => Mode::Select {
-                        cursor: 0,
-                        selected: lines.into_iter().collect(),
-                    },
-                    None => Mode::Browse,
+            KeyCode::Esc => self.mode = Self::back_from_input(lines.take()),
+            KeyCode::Enter => {
+                let name = input.trim().to_string();
+                if name.is_empty() {
+                    self.status = Some("branch name cannot be empty".to_string());
+                    return;
+                }
+                if name.contains(char::is_whitespace) {
+                    self.status = Some("branch name cannot contain whitespace".to_string());
+                    return;
+                }
+                self.mode = Mode::Name {
+                    input: String::new(),
+                    lines: lines.take(),
+                    branch: Some(name),
                 };
             }
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(c) => input.push(c),
+            _ => {}
+        }
+    }
+
+    fn key_name(&mut self, key: KeyEvent) {
+        let Mode::Name {
+            input,
+            lines,
+            branch,
+        } = &mut self.mode
+        else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.mode = Self::back_from_input(lines.take()),
             KeyCode::Enter => {
                 let msg = input.trim().to_string();
                 if msg.is_empty() {
@@ -453,7 +522,10 @@ impl App {
                     return;
                 }
                 let lines = lines.take();
-                self.commits.push(msg);
+                self.commits.push(CommitSpec {
+                    message: msg,
+                    branch: branch.take(),
+                });
                 self.assign_current(self.commits.len() - 1, lines);
             }
             KeyCode::Backspace => {
@@ -479,7 +551,7 @@ impl App {
                         self.status = Some("commit message cannot be empty".to_string());
                         return;
                     }
-                    self.commits[*sel] = msg;
+                    self.commits[*sel].message = msg;
                     *edit = None;
                 }
                 KeyCode::Backspace => {
@@ -498,7 +570,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => *sel = sel.saturating_sub(1),
             KeyCode::Char('e') => {
                 if n_commits > 0 {
-                    *edit = Some(self.commits[*sel].clone());
+                    *edit = Some(self.commits[*sel].message.clone());
                 }
             }
             KeyCode::Char('m') => {
@@ -636,11 +708,46 @@ mod tests {
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Enter);
 
-        assert_eq!(app.commits, vec!["c0", "c2", "c1"]);
+        let messages: Vec<&str> = app.commits.iter().map(|c| c.message.as_str()).collect();
+        assert_eq!(messages, vec!["c0", "c2", "c1"]);
         assert_eq!(app.assign[0][1][0], Some(2));
         assert_eq!(app.assign[0][2][0], Some(1));
 
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.mode, Mode::Browse));
+    }
+
+    #[test]
+    fn branch_key_creates_commit_on_new_branch() {
+        let mut app = app_with_hunks(2);
+        press(&mut app, KeyCode::Char('b'));
+        for c in "topic".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Name { .. }));
+        for c in "fix".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.commits.len(), 1);
+        assert_eq!(app.commits[0].message, "fix");
+        assert_eq!(app.commits[0].branch.as_deref(), Some("topic"));
+        assert_eq!(app.assign[0][0][0], Some(0));
+    }
+
+    #[test]
+    fn branch_name_rejects_empty_and_whitespace() {
+        let mut app = app_with_hunks(1);
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.status.is_some());
+        assert!(matches!(app.mode, Mode::Branch { .. }));
+        for c in "a b".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Branch { .. }));
     }
 }

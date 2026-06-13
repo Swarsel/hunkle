@@ -1,7 +1,7 @@
 ;;; hunkle.el --- Split staged changes into commits in a hunk by hunk fashion -*- lexical-binding: t; -*-
 
 ;; Author: Leon Schwarzäugl
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1") (magit "3.3.0"))
 ;; Keywords: vc, convenience
 
@@ -14,6 +14,8 @@
 ;;
 ;; Keys in the hunkle buffer:
 ;;   n        create a new commit and assign the target to it
+;;   b        create a new commit on a new branch (forked from HEAD)
+;;            and assign the target to it
 ;;   1-9      assign the target to that commit
 ;;   0        assign by commit number
 ;;   v/V      start a line selection;  move to extend,
@@ -56,6 +58,10 @@
   "Foreground/weight of the per-line commit tag in the gutter.
 The diff line's background still shows through.")
 
+(defface hunkle-branch
+  '((t :inherit magit-branch-local))
+  "Face for the target branch of a commit.")
+
 (defun hunkle--face (string face)
   "Propertize STRING with FACE as both `face' and `font-lock-face'."
   (propertize string 'face face 'font-lock-face face))
@@ -70,7 +76,9 @@ The diff line's background still shows through.")
 (defvar-local hunkle--token nil)
 (defvar-local hunkle--branch nil)
 (defvar-local hunkle--commits nil
-  "List of commit messages, in creation order.")
+  "List of (MESSAGE . BRANCH) conses, in creation order.
+BRANCH is nil for commits on the current branch, or the name of a
+new branch to create from HEAD.")
 (defvar-local hunkle--assign nil
   "Hash table mapping (FILE HUNK LINE) index lists to commit indices.")
 
@@ -102,8 +110,8 @@ The diff line's background still shows through.")
   "Read the staged hunks into the buffer-local state."
   (let ((dump (json-parse-string (hunkle--call nil "dump")
                                  :object-type 'alist :array-type 'list)))
-    (unless (eql (alist-get 'version dump) 1)
-      (error "Unsupported hunkle protocol version; update hunkle.el"))
+    (unless (eql (alist-get 'version dump) 2)
+      (error "Unsupported hunkle protocol version; update hunkle and hunkle.el"))
     (setq hunkle--files (alist-get 'files dump)
           hunkle--token (alist-get 'token dump)
           hunkle--branch (alist-get 'branch dump)
@@ -186,14 +194,17 @@ The diff line's background still shows through.")
     (if (null hunkle--commits)
         (insert (hunkle--face "  none yet -- press n on a hunk\n" 'shadow))
       (let ((ci 0))
-        (dolist (msg hunkle--commits)
-          (let ((stats (hunkle--commit-stats ci)))
+        (dolist (commit hunkle--commits)
+          (let ((stats (hunkle--commit-stats ci))
+                (branch (cdr commit)))
             (insert
              (propertize
               (concat "  "
                       (hunkle--face (format "[%s]" (hunkle--key-label ci))
                                     'hunkle-key)
-                      " " msg
+                      " " (car commit)
+                      (and branch
+                           (hunkle--face (format " -> %s" branch) 'hunkle-branch))
                       (hunkle--face (format "  (+%d -%d)" (car stats) (cdr stats))
                                     'shadow)
                       "\n")
@@ -307,13 +318,20 @@ key to assign the selected lines."
     (push-mark bol t t))
   (message "Line selection (move to extend), then a commit key assigns"))
 
+(defun hunkle--commit-label (ci)
+  "Human-readable label of commit CI, including its target branch."
+  (let ((commit (nth ci hunkle--commits)))
+    (if (cdr commit)
+        (format "%s -> %s" (car commit) (cdr commit))
+      (car commit))))
+
 (defun hunkle--assign-locs (locs ci)
   "Assign every loc in LOCS to commit CI and redraw."
   (dolist (loc locs)
     (puthash loc ci hunkle--assign))
   (hunkle--render)
   (message "%d line(s) -> [%s] %s"
-           (length locs) (hunkle--key-label ci) (nth ci hunkle--commits)))
+           (length locs) (hunkle--key-label ci) (hunkle--commit-label ci)))
 
 (defun hunkle--check-commit (ci)
   (unless (and (>= ci 0) (< ci (length hunkle--commits)))
@@ -335,18 +353,37 @@ key to assign the selected lines."
   (hunkle--assign-locs
    (or (hunkle--targets) (user-error "No hunk at point")) (1- n)))
 
-(defun hunkle-new-commit (msg)
-  "Create a new commit with message MSG; assign the hunk/region to it."
-  (interactive (list (read-string "New commit message: ")))
+(defun hunkle--add-commit (msg branch)
+  "Add a commit with message MSG targeting BRANCH; assign the hunk/region."
   (when (string-empty-p (string-trim msg))
     (user-error "Commit message cannot be empty"))
   (let ((targets (hunkle--targets)))
-    (setq hunkle--commits (append hunkle--commits (list msg)))
+    (setq hunkle--commits (append hunkle--commits (list (cons msg branch))))
     (if targets
         (hunkle--assign-locs targets (1- (length hunkle--commits)))
       (hunkle--render)
       (message "Created [%s] %s -- nothing assigned yet"
-               (hunkle--key-label (1- (length hunkle--commits))) msg))))
+               (hunkle--key-label (1- (length hunkle--commits)))
+               (hunkle--commit-label (1- (length hunkle--commits)))))))
+
+(defun hunkle-new-commit (msg)
+  "Create a new commit with message MSG; assign the hunk/region to it."
+  (interactive (list (read-string "New commit message: ")))
+  (hunkle--add-commit msg nil))
+
+(defun hunkle-new-branch-commit (branch msg)
+  "Create a new commit with MSG on new BRANCH; assign the hunk/region to it.
+The branch is forked from the current HEAD.  Lines committed to it
+are unstaged from the current checkout and removed from the working
+tree (unless the file has unstaged edits)."
+  (interactive (list (read-string "New branch (from HEAD): ")
+                     (read-string "New commit message: ")))
+  (setq branch (string-trim branch))
+  (when (string-empty-p branch)
+    (user-error "Branch name cannot be empty"))
+  (when (string-match-p "[[:space:]]" branch)
+    (user-error "Branch name cannot contain whitespace"))
+  (hunkle--add-commit msg branch))
 
 (defun hunkle-unassign ()
   "Unassign the hunk at point (or the region's lines)."
@@ -370,10 +407,10 @@ key to assign the selected lines."
   (unless hunkle--commits (user-error "No commits yet"))
   (let* ((ci (hunkle--commit-at-point-or-read "Edit message of commit number: "))
          (msg (read-string (format "Message for [%s]: " (hunkle--key-label ci))
-                           (nth ci hunkle--commits))))
+                           (car (nth ci hunkle--commits)))))
     (when (string-empty-p (string-trim msg))
       (user-error "Commit message cannot be empty"))
-    (setf (nth ci hunkle--commits) msg)
+    (setf (car (nth ci hunkle--commits)) msg)
     (hunkle--render)))
 
 (defun hunkle-swap-commits ()
@@ -410,33 +447,55 @@ key to assign the selected lines."
              hunkle--assign)
     (json-serialize
      `((token . ,hunkle--token)
-       (commits . ,(vconcat hunkle--commits))
+       (commits . ,(vconcat (mapcar (lambda (c)
+                                      (if (cdr c)
+                                          `((message . ,(car c))
+                                            (branch . ,(cdr c)))
+                                        (car c)))
+                                    hunkle--commits)))
        (assignments . ,(vconcat (nreverse entries)))))))
 
 (defun hunkle--apply ()
-  "Run `hunkle apply' with the current plan; return the created commits."
-  (let ((result (json-parse-string (hunkle--call (hunkle--plan-json) "apply")
-                                   :object-type 'alist :array-type 'list)))
-    (alist-get 'commits result)))
+  "Run `hunkle apply' with the current plan; return the parsed result."
+  (json-parse-string (hunkle--call (hunkle--plan-json) "apply")
+                     :object-type 'alist :array-type 'list
+                     :null-object nil))
 
 (defun hunkle-create-commits ()
   "Create the planned commits."
   (interactive)
   (when (hash-table-empty-p hunkle--assign)
     (user-error "Nothing assigned yet"))
-  (let ((n (length (delete-dups (hash-table-values hunkle--assign))))
-        (left (hunkle--unassigned-count)))
-    (when (y-or-n-p (format "Create %d commit(s) on %s%s? " n hunkle--branch
+  (let* ((cis (delete-dups (hash-table-values hunkle--assign)))
+         (branches (delete-dups
+                    (delq nil (mapcar (lambda (ci) (cdr (nth ci hunkle--commits)))
+                                      cis))))
+         (left (hunkle--unassigned-count)))
+    (when (y-or-n-p (format "Create %d commit(s) on %s%s%s? "
+                            (length cis) hunkle--branch
+                            (if branches
+                                (format " and new branch(es) %s"
+                                        (string-join branches ", "))
+                              "")
                             (if (> left 0)
                                 (format " (%d lines stay staged)" left)
                               "")))
-      (let ((commits (hunkle--apply)))
-        (message "hunkle: created %d commit(s): %s"
+      (let* ((result (hunkle--apply))
+             (commits (alist-get 'commits result))
+             (skipped (alist-get 'worktree_skipped result)))
+        (message "hunkle: created %d commit(s): %s%s"
                  (length commits)
                  (mapconcat (lambda (c)
-                              (format "%.10s %s"
-                                      (alist-get 'id c) (alist-get 'message c)))
-                            commits ", "))
+                              (format "%.10s %s%s"
+                                      (alist-get 'id c) (alist-get 'message c)
+                                      (if (alist-get 'branch c)
+                                          (format " -> %s" (alist-get 'branch c))
+                                        "")))
+                            commits ", ")
+                 (if skipped
+                     (format "; kept branch lines in worktree of %s (unstaged edits)"
+                             (string-join skipped ", "))
+                   ""))
         (when (fboundp 'magit-refresh-all)
           (magit-refresh-all))
         (if (> left 0)
@@ -466,6 +525,7 @@ assignments would be discarded."
       (define-key map (kbd k) #'hunkle-assign-digit))
     (define-key map (kbd "0") #'hunkle-assign-number)
     (define-key map (kbd "n") #'hunkle-new-commit)
+    (define-key map (kbd "b") #'hunkle-new-branch-commit)
     (define-key map (kbd "v") #'hunkle-begin-selection)
     (define-key map (kbd "V") #'hunkle-select-line)
     (define-key map (kbd "u") #'hunkle-unassign)

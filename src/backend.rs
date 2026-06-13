@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context as _, Result, bail};
 
 use crate::diff::{self, FileDiff, FileKind};
-use crate::model::PlannedCommit;
+use crate::model::{IndexUpdate, Plan};
 
 pub struct RepoState {
     pub files: Vec<FileDiff>,
@@ -14,9 +14,15 @@ pub struct RepoState {
     pub branch: String,
 }
 
+#[derive(Debug)]
+pub struct CreatedCommits {
+    pub ids: Vec<String>,
+    pub worktree_skipped: Vec<String>,
+}
+
 pub trait Backend {
     fn read_state(&self) -> Result<RepoState>;
-    fn create_commits(&self, plan: &[PlannedCommit]) -> Result<Vec<String>>;
+    fn create_commits(&self, plan: &Plan) -> Result<CreatedCommits>;
 }
 
 pub fn create(name: &str, dir: &Path) -> Result<Box<dyn Backend>> {
@@ -121,23 +127,53 @@ impl Backend for GitBackend {
         })
     }
 
-    fn create_commits(&self, plan: &[PlannedCommit]) -> Result<Vec<String>> {
-        if plan.is_empty() {
+    fn create_commits(&self, plan: &Plan) -> Result<CreatedCommits> {
+        if plan.commits.is_empty() {
             bail!("nothing to commit");
         }
+        let mut branches: Vec<String> = Vec::new();
+        for commit in &plan.commits {
+            if let Some(b) = &commit.branch
+                && !branches.contains(b)
+            {
+                branches.push(b.clone());
+            }
+        }
+        for b in &branches {
+            self.git(&["check-ref-format", "--branch", b], None, None)
+                .map_err(|_| anyhow::anyhow!("invalid branch name {b:?}"))?;
+            let ref_name = format!("refs/heads/{b}");
+            if self
+                .git_str(&["rev-parse", "--verify", "--quiet", &ref_name], None)
+                .is_ok_and(|s| !s.is_empty())
+            {
+                bail!("branch {b:?} already exists");
+            }
+        }
         let git_dir = self.git_str(&["rev-parse", "--absolute-git-dir"], None)?;
-        let tmp_index = PathBuf::from(git_dir).join(format!("hunkle-index-{}", std::process::id()));
         let original_head = self.head();
+        let mut tmp_indexes: Vec<PathBuf> = Vec::new();
 
         let result = (|| {
-            let idx = Some(tmp_index.as_path());
-            match &original_head {
-                Some(head) => self.git(&["read-tree", head], None, idx)?,
-                None => self.git(&["read-tree", "--empty"], None, idx)?,
-            };
-            let mut parent = original_head.clone();
+            let mut dests: HashMap<Option<String>, (PathBuf, Option<String>)> = HashMap::new();
             let mut created = Vec::new();
-            for commit in plan {
+            for commit in &plan.commits {
+                if !dests.contains_key(&commit.branch) {
+                    let path = PathBuf::from(&git_dir).join(format!(
+                        "hunkle-index-{}-{}",
+                        std::process::id(),
+                        dests.len()
+                    ));
+                    let idx = Some(path.as_path());
+                    match &original_head {
+                        Some(head) => self.git(&["read-tree", head], None, idx)?,
+                        None => self.git(&["read-tree", "--empty"], None, idx)?,
+                    };
+                    tmp_indexes.push(path.clone());
+                    dests.insert(commit.branch.clone(), (path, original_head.clone()));
+                }
+                let (path, parent) = dests.get_mut(&commit.branch).expect("dest just inserted");
+                let idx = Some(path.as_path());
                 for fc in &commit.files {
                     match &fc.content {
                         Some(content) => {
@@ -166,36 +202,98 @@ impl Backend for GitBackend {
                 }
                 let tree = self.git_str(&["write-tree"], idx)?;
                 let mut args = vec!["commit-tree", tree.as_str()];
-                if let Some(p) = &parent {
+                if let Some(p) = parent.as_deref() {
                     args.push("-p");
-                    args.push(p.as_str());
+                    args.push(p);
                 }
                 args.push("-m");
                 args.push(&commit.message);
                 let sha = self.git_str(&args, None)?;
-                parent = Some(sha.clone());
+                *parent = Some(sha.clone());
                 created.push(sha);
             }
-            let last = created.last().expect("plan is non-empty");
-            match &original_head {
-                Some(head) => self.git(
-                    &[
-                        "update-ref",
-                        "-m",
-                        "hunkle: split staged changes",
-                        "HEAD",
-                        last,
-                        head,
-                    ],
-                    None,
-                    None,
-                )?,
-                None => self.git(&["update-ref", "HEAD", last], None, None)?,
-            };
-            Ok(created)
+            if let Some((_, Some(tip))) = dests.get(&None) {
+                match &original_head {
+                    Some(head) => self.git(
+                        &[
+                            "update-ref",
+                            "-m",
+                            "hunkle: split staged changes",
+                            "HEAD",
+                            tip,
+                            head,
+                        ],
+                        None,
+                        None,
+                    )?,
+                    None => self.git(&["update-ref", "HEAD", tip], None, None)?,
+                };
+            }
+            for b in &branches {
+                if let Some((_, Some(tip))) = dests.get(&Some(b.clone())) {
+                    self.git(&["branch", b, tip], None, None)?;
+                }
+            }
+            let worktree_skipped = self.apply_index_updates(&plan.index_updates)?;
+            Ok(CreatedCommits {
+                ids: created,
+                worktree_skipped,
+            })
         })();
 
-        let _ = std::fs::remove_file(&tmp_index);
+        for path in &tmp_indexes {
+            let _ = std::fs::remove_file(path);
+        }
         result
+    }
+}
+
+impl GitBackend {
+    fn apply_index_updates(&self, updates: &[IndexUpdate]) -> Result<Vec<String>> {
+        let mut skipped = Vec::new();
+        for up in updates {
+            match &up.content {
+                Some(content) => {
+                    let sha = String::from_utf8_lossy(&self.git(
+                        &["hash-object", "-w", "--stdin"],
+                        Some(content),
+                        None,
+                    )?)
+                    .trim()
+                    .to_string();
+                    let cacheinfo = format!("{},{},{}", up.mode, sha, up.path);
+                    self.git(
+                        &["update-index", "--add", "--cacheinfo", &cacheinfo],
+                        None,
+                        None,
+                    )?;
+                }
+                None => {
+                    self.git(
+                        &["update-index", "--force-remove", "--", &up.path],
+                        None,
+                        None,
+                    )?;
+                }
+            }
+            let wt_path = self.dir.join(&up.path);
+            let wt = std::fs::read(&wt_path).ok();
+            if wt.as_deref() == up.staged.as_deref() {
+                match &up.content {
+                    Some(content) => {
+                        if let Some(dir) = wt_path.parent() {
+                            std::fs::create_dir_all(dir)?;
+                        }
+                        std::fs::write(&wt_path, content)?;
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&wt_path);
+                    }
+                }
+            } else {
+                skipped.push(up.path.clone());
+            }
+        }
+        Ok(skipped)
     }
 }

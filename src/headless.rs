@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, RepoState};
 use crate::diff::{FileDiff, FileKind, LineKind};
-use crate::model::{build_plan, empty_assignments};
+use crate::model::{CommitSpec, build_plan, empty_assignments};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Serialize)]
 struct DumpOut<'a> {
@@ -38,19 +38,32 @@ struct LineOut<'a> {
 #[derive(Deserialize)]
 struct ApplyIn {
     token: String,
-    commits: Vec<String>,
+    commits: Vec<CommitIn>,
     assignments: Vec<(usize, usize, usize, usize)>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CommitIn {
+    Message(String),
+    Spec {
+        message: String,
+        #[serde(default)]
+        branch: Option<String>,
+    },
 }
 
 #[derive(Serialize)]
 struct ApplyOut {
     commits: Vec<CommitOut>,
+    worktree_skipped: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct CommitOut {
     id: String,
     message: String,
+    branch: Option<String>,
 }
 
 fn files_out(files: &[FileDiff]) -> Vec<FileOut<'_>> {
@@ -118,8 +131,25 @@ pub fn apply(backend: &dyn Backend, input: &str) -> Result<String> {
     if state_token(&state)? != req.token {
         bail!("staged changes have changed since the plan was created; re-run dump");
     }
-    if req.commits.iter().any(|m| m.trim().is_empty()) {
+    let specs: Vec<CommitSpec> = req
+        .commits
+        .into_iter()
+        .map(|c| match c {
+            CommitIn::Message(message) => CommitSpec {
+                message,
+                branch: None,
+            },
+            CommitIn::Spec { message, branch } => CommitSpec { message, branch },
+        })
+        .collect();
+    if specs.iter().any(|c| c.message.trim().is_empty()) {
         bail!("commit messages cannot be empty");
+    }
+    if specs
+        .iter()
+        .any(|c| c.branch.as_deref().is_some_and(|b| b.trim().is_empty()))
+    {
+        bail!("branch names cannot be empty");
     }
     let mut assign = empty_assignments(&state.files);
     for &(fi, hi, li, ci) in &req.assignments {
@@ -132,25 +162,28 @@ pub fn apply(backend: &dyn Backend, input: &str) -> Result<String> {
         if !line.is_change() {
             bail!("assignment ({fi},{hi},{li}) targets a context line");
         }
-        if ci >= req.commits.len() {
+        if ci >= specs.len() {
             bail!("assignment ({fi},{hi},{li}) targets unknown commit {ci}");
         }
         assign[fi][hi][li] = Some(ci);
     }
-    let plan = build_plan(&state.files, &assign, &state.bases, &req.commits);
-    if plan.is_empty() {
+    let plan = build_plan(&state.files, &assign, &state.bases, &specs);
+    if plan.commits.is_empty() {
         bail!("no lines assigned; nothing to commit");
     }
-    let ids = backend.create_commits(&plan)?;
+    let created = backend.create_commits(&plan)?;
     let out = ApplyOut {
-        commits: ids
+        commits: created
+            .ids
             .into_iter()
-            .zip(plan.iter())
+            .zip(plan.commits.iter())
             .map(|(id, c)| CommitOut {
                 id,
                 message: c.message.clone(),
+                branch: c.branch.clone(),
             })
             .collect(),
+        worktree_skipped: created.worktree_skipped,
     };
     Ok(serde_json::to_string_pretty(&out)?)
 }

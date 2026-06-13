@@ -54,14 +54,27 @@ fn main() -> Result<()> {
         Outcome::Quit => {
             println!("hunkle: aborted — no commits created, staged changes untouched.");
         }
-        Outcome::Committed(commits) => {
+        Outcome::Committed {
+            commits,
+            worktree_skipped,
+        } => {
             println!("hunkle: created {} commit(s):", commits.len());
-            for (id, msg) in &commits {
-                println!("  {} {}", &id[..10.min(id.len())], msg);
+            for (id, msg, branch) in &commits {
+                let dest = match branch {
+                    Some(b) => format!(" (on new branch {b})"),
+                    None => String::new(),
+                };
+                println!("  {} {}{}", &id[..10.min(id.len())], msg, dest);
             }
             let left = app.unassigned_count();
             if left > 0 {
                 println!("{left} change line(s) were not assigned and remain staged.");
+            }
+            if !worktree_skipped.is_empty() {
+                println!(
+                    "warning: kept branch-assigned lines in the working tree of {} (unstaged edits present); remove them manually.",
+                    worktree_skipped.join(", ")
+                );
             }
         }
     }
@@ -83,16 +96,21 @@ fn run(
         if app.request_commit {
             app.request_commit = false;
             let plan = app.plan();
-            if plan.is_empty() {
+            if plan.commits.is_empty() {
                 app.status = Some("nothing assigned — no commits to create".to_string());
             } else {
                 match backend.create_commits(&plan) {
-                    Ok(ids) => {
-                        let pairs = ids
+                    Ok(created) => {
+                        let commits = created
+                            .ids
                             .into_iter()
-                            .zip(plan.iter().map(|c| c.message.clone()))
+                            .zip(&plan.commits)
+                            .map(|(id, c)| (id, c.message.clone(), c.branch.clone()))
                             .collect();
-                        app.outcome = Some(Outcome::Committed(pairs));
+                        app.outcome = Some(Outcome::Committed {
+                            commits,
+                            worktree_skipped: created.worktree_skipped,
+                        });
                     }
                     Err(e) => app.status = Some(format!("commit failed: {e}")),
                 }
