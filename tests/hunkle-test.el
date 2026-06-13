@@ -181,6 +181,107 @@
     (should (equal (hunkle-test--git dir "diff" "--cached") ""))
     (should (equal (hunkle-test--git dir "diff") ""))))
 
+(ert-deftest hunkle-fully-assigned-hunk-moves-to-assigned-section ()
+  (let ((dir (hunkle-test--make-repo)))
+    (hunkle-test--with-buffer dir
+      (setq hunkle--commits (list (cons "c" nil)))
+      (hunkle--assign-locs (hunkle--hunk-locs 0 0) 0)
+      (let* ((s (buffer-string))
+             (sp (string-match "Staged changes (4 unassigned lines)" s))
+             (ap (string-match "Assigned changes (2 assigned lines)" s)))
+        (should sp)
+        (should ap)
+        (should (< sp ap))
+        (let ((staged (substring s sp ap))
+              (assigned (substring s ap)))
+          ;; The fully-assigned hunk (LINE2) leaves the staged list...
+          (should-not (string-match-p "\\+LINE2" staged))
+          (should (string-match-p "\\+LINE2" assigned))
+          ;; ...while the still-pending hunk (LINE18) stays in it.
+          (should (string-match-p "\\+LINE18" staged)))))))
+
+(defun hunkle-test--assign-digit-1 ()
+  "Assign the target to commit 1 just as the `1' key would."
+  (let ((last-command-event ?1))
+    (hunkle-assign-digit)))
+
+(ert-deftest hunkle-assign-on-file-heading-assigns-whole-file ()
+  (let ((dir (hunkle-test--make-repo)))
+    (hunkle-test--with-buffer dir
+      (setq hunkle--commits (list (cons "c" nil)))
+      ;; Point on the f.txt file heading (not a hunk).
+      (goto-char (point-min))
+      (search-forward "f.txt")
+      (forward-line 0)
+      (should-not (hunkle--hunk-at-point))
+      (should (hunkle--file-at-point))
+      ;; Assigning there must cover every hunk of f.txt (both hunks).
+      (hunkle-test--assign-digit-1)
+      (should (hunkle--hunk-fully-assigned-p 0 0))
+      (should (hunkle--hunk-fully-assigned-p 0 1))
+      (should (eql (gethash (car (hunkle--hunk-locs 0 0)) hunkle--assign) 0))
+      (should (eql (gethash (car (hunkle--hunk-locs 0 1)) hunkle--assign) 0))
+      ;; new.txt was untouched.
+      (should-not (gethash (car (hunkle--hunk-locs 1 0)) hunkle--assign)))))
+
+(ert-deftest hunkle-cursor-stays-in-staged-after-assign ()
+  (let ((dir (hunkle-test--make-repo)))
+    (hunkle-test--with-buffer dir
+      (setq hunkle--commits (list (cons "c" nil)))
+      ;; Point on the first (still-pending) hunk of f.txt.
+      (goto-char (point-min))
+      (search-forward "+LINE2")
+      (forward-line 0)
+      (should (equal (cl-subseq (get-text-property (point) 'hunkle-loc) 0 2) '(0 0)))
+      ;; Assigning the whole hunk moves it to the Assigned section; point must
+      ;; not follow it there.
+      (hunkle--assign-locs (hunkle--hunk-locs 0 0) 0)
+      (let ((loc (get-text-property (pos-bol) 'hunkle-loc)))
+        (should loc)
+        (should (eq (hunkle--loc-group loc) 'staged))))))
+
+(ert-deftest hunkle-cursor-stays-in-assigned-after-unassign ()
+  (let ((dir (hunkle-test--make-repo)))
+    (hunkle-test--with-buffer dir
+      (setq hunkle--commits (list (cons "c" nil)))
+      ;; Two fully-assigned hunks of f.txt populate the Assigned section.
+      (hunkle--assign-locs (hunkle--hunk-locs 0 0) 0)
+      (hunkle--assign-locs (hunkle--hunk-locs 0 1) 0)
+      (when magit-root-section (magit-section-show magit-root-section))
+      ;; Point on the first assigned hunk, inside the Assigned section.
+      (goto-char (point-min))
+      (search-forward "Assigned changes")
+      (search-forward "+LINE2")
+      (forward-line 0)
+      (should (eq (hunkle--loc-group (get-text-property (point) 'hunkle-loc)) 'assigned))
+      ;; Unassigning it sends it back to Staged; point must stay in Assigned.
+      (hunkle-unassign)
+      (let ((loc (get-text-property (pos-bol) 'hunkle-loc)))
+        (should loc)
+        (should (eq (hunkle--loc-group loc) 'assigned))))))
+
+(ert-deftest hunkle-folded-section-stays-consistent-across-render ()
+  (let ((dir (hunkle-test--make-repo)))
+    (hunkle-test--with-buffer dir
+      (cl-flet ((file-sec ()
+                  (goto-char (point-min))
+                  (search-forward "f.txt")
+                  (forward-line 0)
+                  (magit-current-section))
+                (body-invisible-p (sec)
+                  (seq-some (lambda (o) (overlay-get o 'invisible))
+                            (overlays-at (1+ (oref sec content))))))
+        (magit-section-hide (file-sec))
+        ;; A re-render (as after every assignment) must keep the fold both in
+        ;; the model and on screen, so a single TAB toggles it.
+        (hunkle--render)
+        (let ((sec (file-sec)))
+          (should (oref sec hidden))
+          (should (body-invisible-p sec))
+          (magit-section-toggle sec)
+          (should-not (oref sec hidden))
+          (should-not (body-invisible-p sec)))))))
+
 (ert-deftest hunkle-stale-token-rejected ()
   (let ((dir (hunkle-test--make-repo)))
     (hunkle-test--with-buffer dir

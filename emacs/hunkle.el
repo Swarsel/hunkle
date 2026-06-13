@@ -1,7 +1,7 @@
 ;;; hunkle.el --- Split staged changes into commits in a hunk by hunk fashion -*- lexical-binding: t; -*-
 
 ;; Author: Leon Schwarzäugl
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.1") (magit "3.3.0"))
 ;; Keywords: vc, convenience
 
@@ -164,20 +164,94 @@ new branch to create from HEAD.")
       (setq fi (1+ fi)))
     n))
 
+(defun hunkle--hunk-fully-assigned-p (fi hi)
+  "Non-nil if every changed line of hunk HI in file FI is assigned."
+  (let ((locs (hunkle--hunk-locs fi hi)))
+    (and locs (cl-every (lambda (loc) (gethash loc hunkle--assign)) locs))))
+
+(defun hunkle--point-group ()
+  "Top-level group at point: `staged', `assigned', `commits', or nil."
+  (let ((sec (magit-current-section)))
+    (while (and sec (not (memq (oref sec value)
+                               '(hunkle-staged hunkle-assigned hunkle-commits))))
+      (setq sec (oref sec parent)))
+    (and sec (pcase (oref sec value)
+               ('hunkle-staged 'staged)
+               ('hunkle-assigned 'assigned)
+               ('hunkle-commits 'commits)))))
+
+(defun hunkle--loc-group (loc)
+  "The group (`staged' or `assigned') that change line LOC renders in now."
+  (if (hunkle--hunk-fully-assigned-p (nth 0 loc) (nth 1 loc)) 'assigned 'staged))
+
+(defun hunkle--loc-< (a b)
+  "Non-nil if loc A sorts before loc B in (file hunk line) order."
+  (cond ((/= (nth 0 a) (nth 0 b)) (< (nth 0 a) (nth 0 b)))
+        ((/= (nth 1 a) (nth 1 b)) (< (nth 1 a) (nth 1 b)))
+        (t (< (nth 2 a) (nth 2 b)))))
+
+(defun hunkle--all-locs ()
+  "All change-line locs, in buffer order."
+  (let ((out nil) (fi 0))
+    (dolist (file hunkle--files)
+      (dotimes (hi (length (alist-get 'hunks file)))
+        (setq out (append out (hunkle--hunk-locs fi hi))))
+      (setq fi (1+ fi)))
+    out))
+
+(defun hunkle--nearest-loc-in-group (loc group)
+  "The change line of GROUP at or after LOC, else the last one before it."
+  (let ((locs (seq-filter (lambda (l) (eq (hunkle--loc-group l) group))
+                          (hunkle--all-locs))))
+    (or (seq-find (lambda (l) (not (hunkle--loc-< l loc))) locs)
+        (car (last locs)))))
+
+(defun hunkle--group-heading-pos (group)
+  "Position of the heading line for GROUP, if present."
+  (save-excursion
+    (goto-char (point-min))
+    (and (re-search-forward
+          (pcase group ('staged "^Staged changes") ('assigned "^Assigned changes")
+                 (_ "^Commits"))
+          nil t)
+         (line-beginning-position))))
+
+(defun hunkle--restore-point (loc group line)
+  "Place point after a re-render from the pre-render LOC, GROUP and LINE."
+  (if (null loc)
+      (forward-line (1- line))
+    (let ((newpos (hunkle--find-loc loc)))
+      (cond
+       ((and newpos (eq (hunkle--loc-group loc) group))
+        (goto-char newpos))
+       ((memq group '(staged assigned))
+        (if-let* ((target (hunkle--nearest-loc-in-group loc group)))
+            (goto-char (hunkle--find-loc target))
+          (if-let* ((hp (hunkle--group-heading-pos group)))
+              (goto-char hp)
+            (when newpos (goto-char newpos)))))
+       (newpos (goto-char newpos))
+       (t (forward-line (1- line)))))))
+
 (defun hunkle--render ()
-  "Redraw the buffer from the current state, keeping point on its line."
+  "Redraw the buffer from the current state, keeping point in place.
+Point stays within the same top-level group it was in, so assigning
+the hunk at point does not drag the cursor into the assigned section
+\(and unassigning does not drag it back into the staged section)."
   (let ((inhibit-read-only t)
         (loc (get-text-property (pos-bol) 'hunkle-loc))
+        (group (hunkle--point-group))
         (line (line-number-at-pos)))
     (erase-buffer)
     (magit-insert-section (magit-section 'hunkle-root)
       (hunkle--insert-commits)
       (insert "\n")
-      (hunkle--insert-files))
+      (hunkle--insert-staged)
+      (hunkle--insert-assigned))
+    (when magit-root-section
+      (magit-section-show magit-root-section))
     (goto-char (point-min))
-    (if-let* ((pos (and loc (hunkle--find-loc loc))))
-        (goto-char pos)
-      (forward-line (1- line)))))
+    (hunkle--restore-point loc group line)))
 
 (defun hunkle--find-loc (loc)
   "Position of the line carrying the `hunkle-loc' LOC, if any."
@@ -211,19 +285,41 @@ new branch to create from HEAD.")
               'hunkle-commit ci)))
           (setq ci (1+ ci)))))))
 
-(defun hunkle--insert-files ()
+(defun hunkle--file-hunk-indices (fi file pred)
+  "Indices of hunks of file FI for which PRED called with (FI HI) is non-nil."
+  (let ((his nil) (hi 0))
+    (dolist (_hunk (alist-get 'hunks file))
+      (when (funcall pred fi hi) (push hi his))
+      (setq hi (1+ hi)))
+    (nreverse his)))
+
+(defun hunkle--insert-staged ()
   (magit-insert-section (magit-section 'hunkle-staged)
     (magit-insert-heading
       (format "Staged changes (%d unassigned lines)" (hunkle--unassigned-count)))
     (let ((fi 0))
       (dolist (file hunkle--files)
-        (hunkle--insert-file fi file)
+        (let ((his (hunkle--file-hunk-indices
+                    fi file (lambda (f h) (not (hunkle--hunk-fully-assigned-p f h))))))
+          (when his (hunkle--insert-file 'staged fi file his)))
         (setq fi (1+ fi))))))
 
-(defun hunkle--insert-file (fi file)
+(defun hunkle--insert-assigned ()
+  (when (> (hash-table-count hunkle--assign) 0)
+    (magit-insert-section (magit-section 'hunkle-assigned t)
+      (magit-insert-heading
+        (format "Assigned changes (%d assigned lines)"
+                (hash-table-count hunkle--assign)))
+      (let ((fi 0))
+        (dolist (file hunkle--files)
+          (let ((his (hunkle--file-hunk-indices fi file #'hunkle--hunk-fully-assigned-p)))
+            (when his (hunkle--insert-file 'assigned fi file his)))
+          (setq fi (1+ fi)))))))
+
+(defun hunkle--insert-file (group fi file his)
   (let ((path (alist-get 'path file))
         (kind (alist-get 'kind file)))
-    (magit-insert-section (magit-section (list 'hunkle-file (alist-get 'path file)))
+    (magit-insert-section (magit-section (list 'hunkle-file group fi path))
       (magit-insert-heading
         (concat (propertize path 'font-lock-face 'magit-diff-file-heading)
                 (and (not (equal kind "modified"))
@@ -231,10 +327,8 @@ new branch to create from HEAD.")
                 (and (eq (alist-get 'binary file) t)
                      (propertize " (binary -- left staged)"
                                  'font-lock-face 'shadow))))
-      (let ((hi 0))
-        (dolist (hunk (alist-get 'hunks file))
-          (hunkle--insert-hunk fi hi hunk)
-          (setq hi (1+ hi)))))))
+      (dolist (hi his)
+        (hunkle--insert-hunk fi hi (nth hi (alist-get 'hunks file)))))))
 
 (defun hunkle--insert-hunk (fi hi hunk)
   (magit-insert-section (magit-section (list 'hunkle-hunk fi hi))
@@ -292,11 +386,31 @@ works."
       (setq sec (oref sec parent)))
     (when sec (cdr (oref sec value)))))
 
+(defun hunkle--file-at-point ()
+  "The (GROUP FI PATH) of the file section at point, if any."
+  (let ((sec (magit-current-section)))
+    (while (and sec
+                (not (and (listp (oref sec value))
+                          (eq (car-safe (oref sec value)) 'hunkle-file))))
+      (setq sec (oref sec parent)))
+    (when sec (cdr (oref sec value)))))
+
+(defun hunkle--file-group-locs (group fi)
+  "Change locs of the hunks of file FI rendered under GROUP."
+  (let ((locs nil)
+        (hunks (alist-get 'hunks (nth fi hunkle--files))))
+    (dotimes (hi (length hunks))
+      (when (eq (if (hunkle--hunk-fully-assigned-p fi hi) 'assigned 'staged) group)
+        (setq locs (append locs (hunkle--hunk-locs fi hi)))))
+    locs))
+
 (defun hunkle--targets ()
-  "Locs to act on: the region's changed lines, else the hunk at point."
+  "Locs to act on: the region's lines, else the hunk, else the whole file."
   (or (hunkle--region-locs)
       (pcase (hunkle--hunk-at-point)
-        (`(,fi ,hi) (hunkle--hunk-locs fi hi)))))
+        (`(,fi ,hi) (hunkle--hunk-locs fi hi)))
+      (pcase (hunkle--file-at-point)
+        (`(,group ,fi ,_path) (hunkle--file-group-locs group fi)))))
 
 (defun hunkle-begin-selection ()
   "Start selecting lines for a partial-hunk assignment.
