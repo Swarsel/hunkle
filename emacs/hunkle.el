@@ -667,6 +667,9 @@ assignments would be discarded."
   :group 'hunkle
   (setq-local magit-section-highlight-hook nil))
 
+(with-eval-after-load 'evil
+  (evil-set-initial-state 'hunkle-mode 'emacs))
+
 ;;;###autoload
 (defun hunkle ()
   "Split the staged changes of the current repository into commits."
