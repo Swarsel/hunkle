@@ -214,21 +214,20 @@ new branch to create from HEAD.")
         ((/= (nth 1 a) (nth 1 b)) (< (nth 1 a) (nth 1 b)))
         (t (< (nth 2 a) (nth 2 b)))))
 
-(defun hunkle--all-locs ()
-  "All change-line locs, in buffer order."
-  (let ((out nil) (fi 0))
-    (dolist (file hunkle--files)
-      (dotimes (hi (length (alist-get 'hunks file)))
-        (setq out (append out (hunkle--hunk-locs fi hi))))
-      (setq fi (1+ fi)))
-    out))
-
 (defun hunkle--nearest-loc-in-group (loc group)
   "The change line of GROUP at or after LOC, else the last one before it."
-  (let ((locs (seq-filter (lambda (l) (eq (hunkle--loc-group l) group))
-                          (hunkle--all-locs))))
-    (or (seq-find (lambda (l) (not (hunkle--loc-< l loc))) locs)
-        (car (last locs)))))
+  (let ((fi 0) before)
+    (catch 'found
+      (dolist (file hunkle--files)
+        (dotimes (hi (length (alist-get 'hunks file)))
+          (let ((locs (hunkle--hunk-locs fi hi)))
+            (when (and locs (eq (hunkle--loc-group (car locs)) group))
+              (dolist (l locs)
+                (if (hunkle--loc-< l loc)
+                    (setq before l)
+                  (throw 'found l))))))
+        (setq fi (1+ fi)))
+      before)))
 
 (defun hunkle--group-heading-pos (group)
   "Position of the heading line for GROUP, if present."
@@ -266,7 +265,14 @@ the hunk at point does not drag the cursor into the assigned section
         (loc (get-text-property (pos-bol) 'hunkle-loc))
         (group (hunkle--point-group))
         (line (line-number-at-pos)))
+    (when magit-root-section
+      (magit-map-sections
+       (lambda (section)
+         (dolist (slot '(start content end))
+           (let ((m (eieio-oref section slot)))
+             (when (markerp m) (set-marker m nil)))))))
     (erase-buffer)
+    (setq magit-section-inhibit-markers 'delay)
     (magit-insert-section (magit-section 'hunkle-root)
       (hunkle--insert-commits)
       (insert "\n")
