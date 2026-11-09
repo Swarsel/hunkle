@@ -24,6 +24,7 @@
 ;;   e        edit a commit message
 ;;   m        swap two commits' numbers (and creation order)
 ;;   g        reload the staged changes (discards assignments)
+;;   RET      view the file of the hunk at point
 ;;   C-c C-c  create the commits
 ;;   C-c C-k  quit without creating commits (changes stay staged)
 ;;
@@ -376,6 +377,7 @@ the hunk at point does not drag the cursor into the assigned section
           (insert gutter prefix content "\n")
           (let ((end (point)))
             (hunkle--put-face beg end face)
+            (put-text-property beg end 'hunkle-line (list fi hi li))
             (when loc (put-text-property beg end 'hunkle-loc loc))
             (hunkle--put-face beg (+ beg (length gutter)) (list 'hunkle-tag face))))
         (setq li (1+ li))))))
@@ -434,6 +436,75 @@ works."
         (`(,fi ,hi) (hunkle--hunk-locs fi hi)))
       (pcase (hunkle--file-at-point)
         (`(,group ,fi ,_path) (hunkle--file-group-locs group fi)))))
+
+(defun hunkle--file-line (fi hi li old)
+  "Line of the file that line LI of hunk HI in file FI corresponds to.
+Counts in the staged file, or in the HEAD file if OLD is non-nil."
+  (let* ((hunk (nth hi (alist-get 'hunks (nth fi hunkle--files))))
+         (header (alist-get 'header hunk))
+         (_ (string-match "^@@ -\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? \\+\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)?"
+                          header))
+         (start (string-to-number (match-string (if old 1 3) header)))
+         (empty (equal (match-string (if old 2 4) header) "0"))
+         (skip (if old "add" "del"))
+         (line (if empty (1+ start) start)))
+    (dolist (l (seq-take (alist-get 'lines hunk) li))
+      (unless (equal (alist-get 'kind l) skip)
+        (setq line (1+ line))))
+    (max line 1)))
+
+(defvar hunkle-view-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "q") #'hunkle-view-quit)
+    map)
+  "Keymap for `hunkle-view-mode'.")
+
+(define-minor-mode hunkle-view-mode
+  "Read-only view of a file opened from the hunkle buffer."
+  :keymap hunkle-view-mode-map
+  (when (fboundp 'evil-normalize-keymaps)
+    (evil-normalize-keymaps)))
+
+(defun hunkle-view-quit ()
+  "Close the file view."
+  (interactive)
+  (quit-window t))
+
+(defun hunkle-visit ()
+  "Show the staged file of the hunk at point in a read-only side window.
+Point is placed on the line at point.  Deleted files are shown as
+they are in HEAD.  Press \\`q' to close the view."
+  (interactive)
+  (pcase-let* ((`(,fi ,hi ,li)
+                (or (get-text-property (pos-bol) 'hunkle-line)
+                    (pcase (hunkle--hunk-at-point) (`(,fi ,hi) (list fi hi 0)))
+                    (pcase (hunkle--file-at-point) (`(,_ ,fi ,_) (list fi nil nil)))
+                    (user-error "No hunk at point")))
+               (file (nth fi hunkle--files))
+               (path (alist-get 'path file))
+               (old (equal (alist-get 'kind file) "deleted"))
+               (line (if hi (hunkle--file-line fi hi li old) 1))
+               (dir default-directory)
+               (buf (get-buffer-create (format "*hunkle-view: %s*" path))))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (setq default-directory dir)
+        (unless (eql 0 (process-file "git" nil t nil "show"
+                                     (concat (if old "HEAD" "") ":" path)))
+          (error "Could not read %s: %s" path (string-trim (buffer-string))))
+        (let ((buffer-file-name (expand-file-name path dir)))
+          (delay-mode-hooks (set-auto-mode)))
+        (font-lock-mode 1)
+        (setq buffer-read-only t)
+        (set-buffer-modified-p nil)
+        (hunkle-view-mode 1)))
+    (pop-to-buffer buf '((display-buffer-reuse-window display-buffer-in-side-window)
+                         (side . right)
+                         (window-width . 0.5)))
+    (goto-char (point-min))
+    (forward-line (1- line))
+    (recenter)))
 
 (defun hunkle-begin-selection ()
   "Start selecting lines for a partial-hunk assignment.
@@ -703,6 +774,7 @@ assignments would be discarded."
     (define-key map (kbd "e") #'hunkle-edit-message)
     (define-key map (kbd "m") #'hunkle-swap-commits)
     (define-key map (kbd "g") #'hunkle-refresh)
+    (define-key map (kbd "RET") #'hunkle-visit)
     (define-key map (kbd "C-c C-c") #'hunkle-create-commits)
     (define-key map (kbd "C-c C-k") #'hunkle-quit)
     map)
@@ -714,7 +786,8 @@ assignments would be discarded."
   (setq-local magit-section-highlight-hook nil))
 
 (with-eval-after-load 'evil
-  (evil-set-initial-state 'hunkle-mode 'emacs))
+  (evil-set-initial-state 'hunkle-mode 'emacs)
+  (evil-make-overriding-map hunkle-view-mode-map))
 
 ;;;###autoload
 (defun hunkle ()

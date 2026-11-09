@@ -51,6 +51,7 @@ The keybinds are essentially the same, with a few new ones:
 | --- | --- |
 | `e` | edit a commit message |
 | `g` | reload the staged changes |
+| `RET` | view the file of the hunk at point |
 | `C-c C-c` | create the commits |
 | `C-c C-k` | quit without committing (changes stay staged) |
 

@@ -293,5 +293,27 @@
         (hunkle-unassign)
         (should-not (gethash '(2 0 1) hunkle--assign))))))
 
+(ert-deftest hunkle-visit-shows-file-at-line-and-quits ()
+  (let ((dir (hunkle-test--make-repo)))
+    (hunkle-test--with-buffer dir
+      (let ((hunkle-buf (current-buffer)))
+        (goto-char (point-min))
+        (search-forward " line16")
+        (hunkle-visit)
+        (should (equal (buffer-name) "*hunkle-view: f.txt*"))
+        (should (window-parameter nil 'window-side))
+        (should buffer-read-only)
+        (should (= (line-number-at-pos) 16))
+        (switch-to-buffer-other-window hunkle-buf)
+        (search-forward "+LINE18")
+        (hunkle-visit)
+        (should (= (line-number-at-pos) 18))
+        (should (equal (buffer-substring (pos-bol) (pos-eol)) "LINE18"))
+        (let ((view (current-buffer)))
+          (call-interactively (key-binding (kbd "q")))
+          (should-not (buffer-live-p view))
+          (should-not (window-with-parameter 'window-side)))
+        (set-buffer hunkle-buf)))))
+
 (provide 'hunkle-test)
 ;;; hunkle-test.el ends here
