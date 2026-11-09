@@ -272,5 +272,26 @@
       (should (null hunkle--commits))
       (should (string-match-p "other.txt" (buffer-string))))))
 
+(ert-deftest hunkle-mirror-file-follows-assignments ()
+  (let ((dir (hunkle-test--make-repo)))
+    (with-temp-file (expand-file-name "lit.org" dir)
+      (insert "#+begin_src\n  alpha\n  beta\n#+end_src\n"))
+    (hunkle-test--git dir "add" "-A")
+    (let ((hunkle-mirror-file "lit.org"))
+      (hunkle-test--with-buffer dir
+        (should (equal (alist-get 'path (car (last hunkle--files))) "lit.org"))
+        (setq hunkle--commits (list (cons "c" nil) (cons "d" nil)))
+        (hunkle--assign-locs (hunkle--hunk-locs 1 0) 0)
+        (should (hunkle--hunk-fully-assigned-p 1 0))
+        (should (equal (mapcar (lambda (l) (gethash l hunkle--assign))
+                               (hunkle--hunk-locs 2 0))
+                       '(nil 0 0 nil)))
+        (hunkle--assign-locs (hunkle--hunk-locs 1 0) 1)
+        (should (eql (gethash '(2 0 1) hunkle--assign) 1))
+        (goto-char (point-min))
+        (search-forward "+alpha")
+        (hunkle-unassign)
+        (should-not (gethash '(2 0 1) hunkle--assign))))))
+
 (provide 'hunkle-test)
 ;;; hunkle-test.el ends here

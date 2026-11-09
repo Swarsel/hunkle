@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, RepoState};
 use crate::diff::{FileDiff, FileKind, LineKind};
+use crate::mirror;
 use crate::model::{CommitSpec, build_plan, empty_assignments};
 
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -13,6 +14,7 @@ struct DumpOut<'a> {
     branch: &'a str,
     token: String,
     files: Vec<FileOut<'a>>,
+    mirror_links: Vec<[usize; 6]>,
 }
 
 #[derive(Serialize)]
@@ -114,20 +116,31 @@ fn state_token(state: &RepoState) -> Result<String> {
     Ok(format!("{:016x}", fnv1a(json.as_bytes())))
 }
 
-pub fn dump(backend: &dyn Backend) -> Result<String> {
-    let state = backend.read_state()?;
+pub fn dump(backend: &dyn Backend, mirror: Option<&str>) -> Result<String> {
+    let mut state = backend.read_state()?;
+    let mut mirror_links: Vec<[usize; 6]> = mirror::prepare(&mut state.files, mirror)
+        .into_iter()
+        .flat_map(|((fi, hi, li), targets)| {
+            targets
+                .into_iter()
+                .map(move |(mfi, mhi, mli)| [fi, hi, li, mfi, mhi, mli])
+        })
+        .collect();
+    mirror_links.sort_unstable();
     let out = DumpOut {
         version: PROTOCOL_VERSION,
         branch: &state.branch,
         token: state_token(&state)?,
         files: files_out(&state.files),
+        mirror_links,
     };
     Ok(serde_json::to_string_pretty(&out)?)
 }
 
-pub fn apply(backend: &dyn Backend, input: &str) -> Result<String> {
+pub fn apply(backend: &dyn Backend, input: &str, mirror: Option<&str>) -> Result<String> {
     let req: ApplyIn = serde_json::from_str(input).context("invalid plan JSON")?;
-    let state = backend.read_state()?;
+    let mut state = backend.read_state()?;
+    mirror::prepare(&mut state.files, mirror);
     if state_token(&state)? != req.token {
         bail!("staged changes have changed since the plan was created; re-run dump");
     }

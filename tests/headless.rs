@@ -226,3 +226,46 @@ fn apply_rejects_context_line_assignment() {
     let err = hunkle(dir, &["apply"], Some(&plan)).unwrap_err();
     assert!(err.contains("context line"), "unexpected error: {err}");
 }
+
+#[test]
+fn dump_orders_and_links_mirror_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    setup_repo(dir);
+
+    fs::write(dir.join("a.org"), "* code\n  x = 1;\n").unwrap();
+    fs::write(dir.join("b.nix"), "x = 1;\n").unwrap();
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-m", "base"]);
+    fs::write(dir.join("a.org"), "* code\n  x = 2;\n").unwrap();
+    fs::write(dir.join("b.nix"), "x = 2;\n").unwrap();
+    git(dir, &["add", "-A"]);
+
+    let plain: Value = serde_json::from_str(&hunkle(dir, &["dump"], None).unwrap()).unwrap();
+    assert_eq!(plain["files"][0]["path"], "a.org");
+    assert_eq!(plain["mirror_links"], json!([]));
+
+    git(dir, &["config", "hunkle.mirror", "a.org"]);
+    let dump: Value = serde_json::from_str(&hunkle(dir, &["dump"], None).unwrap()).unwrap();
+    assert_eq!(dump["files"][0]["path"], "b.nix");
+    assert_eq!(dump["files"][1]["path"], "a.org");
+    assert_eq!(
+        dump["mirror_links"],
+        json!([[0, 0, 0, 1, 0, 1], [0, 0, 1, 1, 0, 2]])
+    );
+    assert_ne!(dump["token"], plain["token"]);
+
+    let disabled: Value =
+        serde_json::from_str(&hunkle(dir, &["--mirror", "", "dump"], None).unwrap()).unwrap();
+    assert_eq!(disabled["files"][0]["path"], "a.org");
+
+    let plan = json!({
+        "token": dump["token"],
+        "commits": ["x"],
+        "assignments": [[0, 0, 0, 0], [0, 0, 1, 0], [1, 0, 1, 0], [1, 0, 2, 0]],
+    })
+    .to_string();
+    hunkle(dir, &["apply"], Some(&plan)).unwrap();
+    assert_eq!(git(dir, &["diff", "--cached"]), "");
+    assert_eq!(git(dir, &["show", "HEAD:a.org"]), "* code\n  x = 2;\n");
+}

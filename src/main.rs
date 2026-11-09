@@ -5,7 +5,7 @@ use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
 
 use hunkle::app::{App, Outcome};
-use hunkle::{backend, headless, ui};
+use hunkle::{backend, headless, mirror, ui};
 
 #[derive(Parser)]
 #[command(name = "hunkle", version)]
@@ -14,6 +14,8 @@ struct Args {
     backend: String,
     #[arg(short = 'C', long = "dir", global = true, default_value = ".")]
     dir: PathBuf,
+    #[arg(long, global = true)]
+    mirror: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -27,20 +29,28 @@ enum Cmd {
 fn main() -> Result<()> {
     let args = Args::parse();
     let backend = backend::create(&args.backend, &args.dir)?;
+    let mirror = args
+        .mirror
+        .or_else(|| backend.config("hunkle.mirror"))
+        .filter(|m| !m.is_empty());
     match args.cmd {
         Some(Cmd::Dump) => {
-            println!("{}", headless::dump(backend.as_ref())?);
+            println!("{}", headless::dump(backend.as_ref(), mirror.as_deref())?);
             return Ok(());
         }
         Some(Cmd::Apply) => {
             let input = std::io::read_to_string(std::io::stdin())?;
-            println!("{}", headless::apply(backend.as_ref(), &input)?);
+            println!(
+                "{}",
+                headless::apply(backend.as_ref(), &input, mirror.as_deref())?
+            );
             return Ok(());
         }
         None => {}
     }
-    let state = backend.read_state()?;
-    let mut app = App::new(state);
+    let mut state = backend.read_state()?;
+    let links = mirror::prepare(&mut state.files, mirror.as_deref());
+    let mut app = App::new(state).with_links(links);
     if app.pending().is_empty() {
         println!("hunkle: nothing to do — no staged text changes found.");
         return Ok(());

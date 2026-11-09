@@ -49,6 +49,17 @@
   "Key bound to `hunkle' in the Magit status buffer by `hunkle-magit-setup'."
   :type 'string)
 
+(defcustom hunkle-mirror-file nil
+  "File (relative to the repository root) that mirrors other files' changes.
+Staged changes in other files that also appear in this file (ignoring
+indentation and blank lines) are assigned to the same commit there
+automatically, and the file is listed last.  When nil, the binary
+falls back to the `hunkle.mirror' git config value; the empty string
+disables mirroring."
+  :type '(choice (const :tag "Use git config hunkle.mirror" nil)
+                 (string :tag "File"))
+  :safe #'stringp)
+
 (defface hunkle-key
   '((t :inherit magit-hash :weight bold))
   "Face for commit number keys.")
@@ -81,6 +92,13 @@ BRANCH is nil for commits on the current branch, or the name of a
 new branch to create from HEAD.")
 (defvar-local hunkle--assign nil
   "Hash table mapping (FILE HUNK LINE) index lists to commit indices.")
+(defvar-local hunkle--links nil
+  "Hash table mapping a change loc to the list of its mirror-file locs.")
+
+(defun hunkle--command (cmd)
+  "Arguments for running hunkle subcommand CMD."
+  (append (and hunkle-mirror-file (list "--mirror" hunkle-mirror-file))
+          (list cmd)))
 
 (defun hunkle--call (input &rest args)
   "Run the hunkle binary with ARGS and INPUT on stdin; return stdout."
@@ -108,7 +126,7 @@ new branch to create from HEAD.")
 
 (defun hunkle--load ()
   "Read the staged hunks into the buffer-local state."
-  (let ((dump (json-parse-string (hunkle--call nil "dump")
+  (let ((dump (json-parse-string (apply #'hunkle--call nil (hunkle--command "dump"))
                                  :object-type 'alist :array-type 'list)))
     (unless (eql (alist-get 'version dump) 2)
       (error "Unsupported hunkle protocol version; update hunkle and hunkle.el"))
@@ -116,7 +134,12 @@ new branch to create from HEAD.")
           hunkle--token (alist-get 'token dump)
           hunkle--branch (alist-get 'branch dump)
           hunkle--commits nil
-          hunkle--assign (make-hash-table :test #'equal))
+          hunkle--assign (make-hash-table :test #'equal)
+          hunkle--links (make-hash-table :test #'equal))
+    (dolist (link (alist-get 'mirror_links dump))
+      (let ((loc (seq-take link 3)))
+        (puthash loc (append (gethash loc hunkle--links) (list (seq-drop link 3)))
+                 hunkle--links)))
     (when (null hunkle--files)
       (user-error "No staged changes"))))
 
@@ -439,13 +462,33 @@ key to assign the selected lines."
         (format "%s -> %s" (car commit) (cdr commit))
       (car commit))))
 
+(defun hunkle--set-loc (loc ci)
+  "Assign LOC to commit CI (nil unassigns); return the mirrored line count.
+Mirror-file lines linked to LOC follow along while they still agree
+with it."
+  (let ((old (gethash loc hunkle--assign))
+        (mirrored 0))
+    (if ci (puthash loc ci hunkle--assign) (remhash loc hunkle--assign))
+    (unless (eql old ci)
+      (dolist (m (and hunkle--links (gethash loc hunkle--links)))
+        (when (eql (gethash m hunkle--assign) old)
+          (if ci (puthash m ci hunkle--assign) (remhash m hunkle--assign))
+          (setq mirrored (1+ mirrored)))))
+    mirrored))
+
+(defun hunkle--mirrored-note (n)
+  "Message suffix for N mirrored lines."
+  (if (> n 0) (format " (+%d mirrored)" n) ""))
+
 (defun hunkle--assign-locs (locs ci)
   "Assign every loc in LOCS to commit CI and redraw."
-  (dolist (loc locs)
-    (puthash loc ci hunkle--assign))
-  (hunkle--render)
-  (message "%d line(s) -> [%s] %s"
-           (length locs) (hunkle--key-label ci) (hunkle--commit-label ci)))
+  (let ((mirrored 0))
+    (dolist (loc locs)
+      (setq mirrored (+ mirrored (hunkle--set-loc loc ci))))
+    (hunkle--render)
+    (message "%d line(s) -> [%s] %s%s"
+             (length locs) (hunkle--key-label ci) (hunkle--commit-label ci)
+             (hunkle--mirrored-note mirrored))))
 
 (defun hunkle--check-commit (ci)
   (unless (and (>= ci 0) (< ci (length hunkle--commits)))
@@ -502,11 +545,13 @@ tree (unless the file has unstaged edits)."
 (defun hunkle-unassign ()
   "Unassign the hunk at point (or the region's lines)."
   (interactive)
-  (let ((locs (or (hunkle--targets) (user-error "No hunk at point"))))
+  (let ((locs (or (hunkle--targets) (user-error "No hunk at point")))
+        (mirrored 0))
     (dolist (loc locs)
-      (remhash loc hunkle--assign))
+      (setq mirrored (+ mirrored (hunkle--set-loc loc nil))))
     (hunkle--render)
-    (message "Unassigned %d line(s)" (length locs))))
+    (message "Unassigned %d line(s)%s" (length locs)
+             (hunkle--mirrored-note mirrored))))
 
 (defun hunkle--commit-at-point-or-read (prompt)
   "Commit index at point, or read a commit number with PROMPT."
@@ -571,7 +616,8 @@ tree (unless the file has unstaged edits)."
 
 (defun hunkle--apply ()
   "Run `hunkle apply' with the current plan; return the parsed result."
-  (json-parse-string (hunkle--call (hunkle--plan-json) "apply")
+  (json-parse-string (apply #'hunkle--call (hunkle--plan-json)
+                            (hunkle--command "apply"))
                      :object-type 'alist :array-type 'list
                      :null-object nil))
 
@@ -682,6 +728,7 @@ assignments would be discarded."
     (with-current-buffer buf
       (hunkle-mode)
       (setq default-directory dir)
+      (hack-dir-local-variables-non-file-buffer)
       (hunkle--load)
       (let ((inhibit-read-only t)) (erase-buffer))
       (hunkle--render)

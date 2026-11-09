@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::backend::RepoState;
 use crate::diff::{FileDiff, LineKind};
+use crate::mirror::Links;
 use crate::model::{Assignments, CommitSpec, Plan, build_plan, empty_assignments};
 
 #[derive(Debug)]
@@ -59,6 +60,7 @@ pub struct App {
     pub request_commit: bool,
     pub outcome: Option<Outcome>,
     pub ext_input: Option<String>,
+    pub links: Links,
     undo_stack: Vec<Snapshot>,
 }
 
@@ -80,8 +82,14 @@ impl App {
             request_commit: false,
             outcome: None,
             ext_input: None,
+            links: Links::new(),
             undo_stack: Vec::new(),
         }
+    }
+
+    pub fn with_links(mut self, links: Links) -> Self {
+        self.links = links;
+        self
     }
 
     pub fn key_label(ci: usize) -> String {
@@ -217,30 +225,60 @@ impl App {
         self.status = Some("undid last change".to_string());
     }
 
-    fn reassign_row(&mut self, fi: usize, hi: usize, from: usize, to: usize) {
-        let mut count = 0;
-        for a in self.assign[fi][hi].iter_mut() {
-            if *a == Some(from) {
-                *a = Some(to);
+    fn set_line(&mut self, fi: usize, hi: usize, li: usize, to: Option<usize>) -> usize {
+        let from = std::mem::replace(&mut self.assign[fi][hi][li], to);
+        let mut mirrored = 0;
+        for &(mfi, mhi, mli) in self.links.get(&(fi, hi, li)).into_iter().flatten() {
+            let a = &mut self.assign[mfi][mhi][mli];
+            if *a == from && from != to {
+                *a = to;
+                mirrored += 1;
+            }
+        }
+        mirrored
+    }
+
+    fn mirrored_note(mirrored: usize) -> String {
+        if mirrored > 0 {
+            format!(" (+{mirrored} mirrored)")
+        } else {
+            String::new()
+        }
+    }
+
+    fn set_row(
+        &mut self,
+        fi: usize,
+        hi: usize,
+        from: Option<usize>,
+        to: Option<usize>,
+    ) -> (usize, usize) {
+        let (mut count, mut mirrored) = (0, 0);
+        for li in 0..self.assign[fi][hi].len() {
+            if self.assign[fi][hi][li] == from {
+                mirrored += self.set_line(fi, hi, li, to);
                 count += 1;
             }
         }
+        (count, mirrored)
+    }
+
+    fn reassign_row(&mut self, fi: usize, hi: usize, from: usize, to: usize) {
+        let (count, mirrored) = self.set_row(fi, hi, Some(from), Some(to));
         self.status = Some(format!(
-            "moved {count} line(s) to [{}] {}",
+            "moved {count} line(s) to [{}] {}{}",
             Self::key_label(to),
-            self.commit_label(to)
+            self.commit_label(to),
+            Self::mirrored_note(mirrored)
         ));
     }
 
     fn unassign_row(&mut self, fi: usize, hi: usize, ci: usize) {
-        let mut count = 0;
-        for a in self.assign[fi][hi].iter_mut() {
-            if *a == Some(ci) {
-                *a = None;
-                count += 1;
-            }
-        }
-        self.status = Some(format!("unassigned {count} line(s)"));
+        let (count, mirrored) = self.set_row(fi, hi, Some(ci), None);
+        self.status = Some(format!(
+            "unassigned {count} line(s){}",
+            Self::mirrored_note(mirrored)
+        ));
     }
 
     fn assign_current(&mut self, commit: usize, lines: Option<Vec<usize>>) {
@@ -249,13 +287,15 @@ impl App {
         };
         let targets = lines.unwrap_or_else(|| self.unassigned_lines(fi, hi));
         let count = targets.len();
+        let mut mirrored = 0;
         for li in targets {
-            self.assign[fi][hi][li] = Some(commit);
+            mirrored += self.set_line(fi, hi, li, Some(commit));
         }
         self.status = Some(format!(
-            "{count} line(s) -> [{}] {}",
+            "{count} line(s) -> [{}] {}{}",
             Self::key_label(commit),
-            self.commit_label(commit)
+            self.commit_label(commit),
+            Self::mirrored_note(mirrored)
         ));
         self.after_assign();
     }
@@ -518,15 +558,18 @@ impl App {
                     if has {
                         self.push_undo();
                     }
-                    let mut n = 0;
-                    for a in self.assign[fi][hi].iter_mut() {
-                        if a.is_some() {
-                            *a = None;
+                    let (mut n, mut mirrored) = (0, 0);
+                    for li in 0..self.assign[fi][hi].len() {
+                        if self.assign[fi][hi][li].is_some() {
+                            mirrored += self.set_line(fi, hi, li, None);
                             n += 1;
                         }
                     }
                     self.status = Some(if n > 0 {
-                        format!("unassigned {n} line(s) of this hunk")
+                        format!(
+                            "unassigned {n} line(s) of this hunk{}",
+                            Self::mirrored_note(mirrored)
+                        )
                     } else {
                         "nothing assigned in this hunk".to_string()
                     });
@@ -962,6 +1005,57 @@ mod tests {
         press(&mut app, KeyCode::Char('u'));
         assert!(matches!(app.mode, Mode::Browse));
         assert!(!app.has_assignments());
+    }
+
+    #[test]
+    fn assignments_follow_into_mirror_file() {
+        let mut files = diff::parse(
+            "\
+diff --git a/lit.org b/lit.org
+index 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644
+--- a/lit.org
++++ b/lit.org
+@@ -1,3 +1,3 @@
+ #+begin_src
+-    old
++    new
+ #+end_src
+@@ -10 +10 @@
+-prose
++more prose
+diff --git a/f.txt b/f.txt
+index 3333333333333333333333333333333333333333..4444444444444444444444444444444444444444 100644
+--- a/f.txt
++++ b/f.txt
+@@ -1 +1 @@
+-old
++new
+",
+        )
+        .unwrap();
+        let links = crate::mirror::prepare(&mut files, Some("lit.org"));
+        let mut app = App::new(RepoState {
+            files,
+            bases: HashMap::new(),
+            branch: "main".to_string(),
+        })
+        .with_links(links);
+        assert_eq!(app.files[1].path, "lit.org");
+        assert_eq!(app.pending(), vec![(0, 0), (1, 0), (1, 1)]);
+
+        name_commit(&mut app, "c0");
+        assert_eq!(app.assign[1][0], vec![None, Some(0), Some(0), None]);
+        assert_eq!(app.pending(), vec![(1, 1)]);
+        assert!(app.status.as_deref().unwrap().contains("+2 mirrored"));
+
+        name_commit(&mut app, "c1");
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.assign[0][0], vec![Some(1), Some(1)]);
+        assert_eq!(app.assign[1][0], vec![None, Some(1), Some(1), None]);
+
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.assign[1][0], vec![None; 4]);
     }
 
     #[test]

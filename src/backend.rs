@@ -23,6 +23,7 @@ pub struct CreatedCommits {
 pub trait Backend {
     fn read_state(&self) -> Result<RepoState>;
     fn create_commits(&self, plan: &Plan) -> Result<CreatedCommits>;
+    fn config(&self, key: &str) -> Option<String>;
 }
 
 pub fn create(name: &str, dir: &Path) -> Result<Box<dyn Backend>> {
@@ -255,6 +256,12 @@ impl Backend for GitBackend {
             let _ = std::fs::remove_file(path);
         }
         result
+    }
+
+    fn config(&self, key: &str) -> Option<String> {
+        self.git_str(&["config", "--get", key], None)
+            .ok()
+            .filter(|s| !s.is_empty())
     }
 }
 
